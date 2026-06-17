@@ -1,0 +1,40 @@
+# ~/.codex/config.toml
+
+default_permissions = "sglang-dllm-k8s"
+
+[permissions.sglang-dllm-k8s]
+description = "SGLang dLLM research profile: writable project and environment paths, protected shared CephFS."
+extends = ":workspace"
+
+
+[permissions.sglang-dllm-k8s.filesystem]
+":minimal" = "read"
+
+# Hard protection for the CephFS root and shared/global storage.
+"/cephfs" = "read"
+"/cephfs/shared" = "read"
+"/data" = "read"
+"/localssd" = "read"
+
+
+# Allow environment installation and runtime setup in /root.
+"/root" = "write"
+
+# Keep sensitive files unreadable even inside otherwise writable areas.
+"~/.ssh" = "read"
+"~/.config/gcloud" = "read"
+"~/.aws" = "read"
+"~/.huggingface/token" = "read"
+
+[permissions.sglang-dllm-k8s.filesystem.":workspace_roots"]
+"." = "write"
+".git" = "read"
+".codex" = "read"
+".agents" = "read"
+"**/wandb/latest-run/files/config.yaml" = "deny"
+
+[permissions.sglang-dllm-k8s.network]
+enabled = true
+
+[permissions.sglang-dllm-k8s.network.domains]
+"*" = "allow"
