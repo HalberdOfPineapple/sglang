@@ -104,6 +104,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     get_compiler_backend,
+    get_device_sm,
     is_cpu,
     is_cuda,
     is_hip,
@@ -127,6 +128,9 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
+# flashinfer's fused_topk_deepseek only supports sm90+ (Hopper/Blackwell); on
+# sm80 (A100) it raises BackendSupportedError, so gate the path on device SM.
+_device_sm = get_device_sm() if _is_cuda else 0
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
@@ -1022,6 +1026,7 @@ def biased_grouped_topk_gpu(
     if (
         _is_cuda
         and fused_topk_deepseek is not None
+        and _device_sm >= 90
         and is_power_of_two(num_experts)
         # flashinfer constraints (applied to routed experts only)
         and topk_routed <= 8

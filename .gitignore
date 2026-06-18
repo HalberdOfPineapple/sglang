@@ -186,6 +186,7 @@ tl_out/
 # Plots
 *.png
 *.pdf
+!26_FOCUS.pdf
 
 # personnal
 work_dirs/
