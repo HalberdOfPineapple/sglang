@@ -6,6 +6,11 @@ import torch.nn.functional as F
 
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.profiling import (
+    dllm_nvtx_pop,
+    dllm_nvtx_push,
+    dllm_nvtx_range,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -33,7 +38,8 @@ class LowConfidence(DllmAlgorithm):
 
         # Fast path: if there is no mask token, forward and save kv cache
         if torch.sum(mask_index).item() == 0:
-            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            with dllm_nvtx_range("dllm_prefill_forward"):
+                out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 
             next_token_ids = []
@@ -43,19 +49,24 @@ class LowConfidence(DllmAlgorithm):
         for block_id in range(batch_size):
             block_start = block_id * self.block_size
             block_end = block_start + self.block_size
+
             block_input_ids = forward_batch.input_ids[block_start:block_end]
             block_mask_index = block_input_ids == self.mask_id
+
             start = self.block_size - torch.sum(block_mask_index).item()
             start_list.append(start)
 
-        for _ in range(self.block_size):
+        # Note the number of iterations is equal to the block size, which means each time only one token is decoded. 
+        for step in range(self.block_size):
             mask_index = forward_batch.input_ids == self.mask_id
             if torch.sum(mask_index).item() == 0:
                 break
 
-            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            with dllm_nvtx_range(f"dllm_forward.step{step}"):
+                out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             assert batch_size == forward_batch.input_ids.shape[0] // self.block_size
+            dllm_nvtx_push(f"dllm_select.step{step}")
             for batch_id in range(batch_size):
                 curr_block_start = batch_id * self.block_size
                 curr_block_end = curr_block_start + self.block_size
@@ -88,8 +99,10 @@ class LowConfidence(DllmAlgorithm):
                     transfer_index[select_index] = True
 
                 block_input_ids[transfer_index] = x[transfer_index]
+            dllm_nvtx_pop()
 
-        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        with dllm_nvtx_range("dllm_final_forward"):
+            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
         # Here next token ids is tricky to implement the dynamic lengths,
         # so we return a list of tensors
