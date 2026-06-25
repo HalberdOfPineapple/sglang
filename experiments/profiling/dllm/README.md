@@ -1,49 +1,62 @@
-# dLLM Profiling Experiments
+# dLLM Distributed-Efficiency Profiling
 
 Experiment **scripts** for the dLLM distributed-efficiency profiling plan
-(`notes/dllm_baseline_profiling_plan.md`). Scripts live in the repo; **outputs
-(profiles, logs, CSVs) are data and go to `/cephfs`**, in a tree that **mirrors
-this `experiments/` hierarchy** so scripts and data line up 1:1.
+(`notes/dllm_baseline_profiling_plan.md`, experiments **D1–D9**). Scripts live in
+the repo; **outputs (profiles, logs, CSVs) are data and go to `/cephfs`** in a
+tree that *mirrors* this hierarchy so scripts and data line up 1:1.
 
-## Layout (scripts mirror data)
+## Layout (one folder per experiment)
 
 ```
 repo : experiments/profiling/dllm/
-         run_d1.sh      # D1: per-step comm decomposition & exposed-comm fraction
-         parse_d1.py    # summarize nsys CSVs (comm-vs-compute + per-step NVTX)
+         README.md                       # this file
+         common/                         # shared helpers (if any)
+         d1_comm_decomposition/          # D1 — per-step comm decomposition & exposed fraction
+           run_d1.sh                     # launch under nsys, bound capture, dump CSVs
+           parse_d1.py                   # comm-vs-compute + per-step NVTX summary
+           README.md                     # the D1 experiment report
 
-data : $DATA_ROOT/profiling/dllm/          (DATA_ROOT default /cephfs/shared/wxli/sglang-dllm)
-         profiles/      # <TAG>.nsys-rep, .sqlite, *_cuda_gpu_kern_sum.csv, *_nvtx_pushpop_sum.csv, ...
-         logs/          # <TAG>_server.log, <TAG>_stats.log
+data : $DATA_ROOT/profiling/dllm/<exp>/  (DATA_ROOT default /cephfs/shared/wxli/sglang-dllm)
+           profiles/                     # <TAG>.nsys-rep, .sqlite, *_cuda_gpu_kern_sum.csv, ...
+           logs/                         # <TAG>_server.log, <TAG>_stats.log, <TAG>_summary.txt
 ```
 
-Override `DATA_ROOT` (whole tree) or `OUT` (this experiment only) to relocate.
+Override `DATA_ROOT` (whole tree) or `OUT` (one experiment) to relocate.
+
+## Plan → folder map
+
+| Exp | Folder | Distributed question |
+|---|---|---|
+| **D1** | `d1_comm_decomposition/` | exposed-comm fraction & TP/EP/DP split per denoising step |
+| **D2** | `d2_sk_amplification/` | comm-per-output-token vs AR (`S_k`× penalty) |
+| D3 | _(todo)_ | strong scaling across TP shapes |
+| D4 | _(todo)_ | EP all-to-all volume & expert-load drift across steps |
+| D5 | _(todo)_ | DP-attention gather/scatter cost in the loop |
+| D6 | _(todo)_ | exposed-comm / overlap headroom |
+| D7 | _(todo)_ | wasted collective rounds from stragglers |
+| D8 | _(todo)_ | per-rank KV/MoE residency, page granularity |
+| D9 | _(todo)_ | inter-node collective cost (multi-node) |
 
 ## Prerequisites
 
 - conda env `sglang` active; `nsys` on PATH.
-- NVTX ranges enabled via `SGLANG_DLLM_NVTX=1` (set by the scripts) — implemented
+- NVTX ranges enabled via `SGLANG_DLLM_NVTX=1` (D1, set by the scripts) and the
+  per-block `S_k` step counter via `SGLANG_DLLM_PROFILE=1` (D2) — both implemented
   in `python/sglang/srt/dllm/profiling.py`, used by
-  `python/sglang/srt/dllm/algorithm/low_confidence.py`. No-op when unset.
+  `python/sglang/srt/dllm/algorithm/low_confidence.py`. No-op when unset, so the
+  baseline path is bit-identical with the flags off.
 - Working launch config: see memory `llada2-launch-config-a100` and
-  `dllm-nsys-profiling-method`.
+  `dllm-nsys-profiling-method`; on A100 (sm80) the `a100-sm80-flashinfer-topk-fallback`
+  patch is required (H100/sm90 uses the fused path directly).
 
-## Usage
+## Key gotcha (carries across all comm experiments)
 
-```bash
-source "$(conda info --base)/etc/profile.d/conda.sh" && conda activate sglang
-# Run A — production (CUDA graph ON)
-TAG=d1_tp4        bash experiments/profiling/dllm/run_d1.sh
-# Run B — eager (exposes graph-internal NCCL; CUDA graph hides it)
-TAG=d1_tp4_eager EXTRA_ARGS="--disable-cuda-graph" READY_TIMEOUT=600 \
-                  bash experiments/profiling/dllm/run_d1.sh
-```
+The dLLM forward is **CUDA-graphed by default**, so NCCL kernels are *inside* the
+graph and invisible to plain nsys. Two ways to see them:
+- **Preferred:** keep the graph and add `nsys --cuda-graph-trace=node` so in-graph
+  kernels (incl. NCCL) are recorded individually — faithful production comm.
+- **Cross-check only:** `--disable-cuda-graph` (eager) exposes NCCL but *inflates*
+  it via cross-rank spin-wait — a worst-case bound, not a production number.
 
-Override knobs via env: `TP`, `EP`, `MEMFRAC`, `MAXREQ`, `GEN_TOKENS`, `MODEL`,
-`PORT`, `OUT`, `EXTRA_ARGS`.
-
-## Key gotcha
-
-The dLLM forward is CUDA-graphed by default, so NCCL kernels are *inside* the
-graph and invisible to nsys — use `--disable-cuda-graph` (Run B) to decompose
-comm. Findings: `notes/experiment_20260619_d1_comm_decomposition.md`.
+`run_d1.sh` does the preferred method for the production run and supports the
+eager run via `EXTRA_ARGS="--disable-cuda-graph"`.

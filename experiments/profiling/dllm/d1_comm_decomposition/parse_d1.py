@@ -3,12 +3,16 @@
 
 Usage: parse_d1.py <REP>   where <REP> is the nsys output prefix, so that
   <REP>_cuda_gpu_kern_sum.csv and <REP>_nvtx_pushpop_sum.csv exist.
+  If <REP>.sqlite also exists, an accurate PER-FORWARD-STEP comm proportion is
+  computed structurally from the CUDA graph (see graph_forward_summary).
 
 Kernel names contain commas, so parse with csv.DictReader (never naive split).
 See notes/experiment_20260619_d1_comm_decomposition.md for interpretation/caveats.
 """
 import csv
+import os
 import re
+import sqlite3
 import sys
 
 COMM_RE = re.compile(
@@ -115,6 +119,83 @@ def nvtx_pushpop_summary(path: str) -> None:
         agg(p)
 
 
+# Collectives only (tighter than the broad COMM_RE): actual cross-rank kernels.
+# Used for the per-graph split where we must not false-match compute kernels.
+COLLECTIVE_RE = re.compile(
+    r"nccl|all.?reduce|all.?to.?all|all.?gather|reduce.?scatter|"
+    r"sendrecv|nvshmem|cross_device_reduce|one.?shot|two.?shot",
+    re.I,
+)
+
+
+def graph_forward_summary(sqlite_path: str) -> None:
+    """Per-forward-step comm proportion, computed STRUCTURALLY from the CUDA graph.
+
+    A dLLM forward step replays a *captured* CUDA graph, so its comm fraction is a
+    fixed property of the kernels INSIDE that graph -- not something to recover by
+    NVTX-window timestamp overlap. Overlap is wrong here: the graph replay launches
+    async, so the CPU `dllm_forward.step` window closes before its GPU kernels run;
+    time-overlap then under-counts forward (~3.5 vs ~7.3 ms/call) and spills work
+    into `select`. Launch-time projection is also unreliable because in-graph
+    kernels carry the *capture-time* correlationId, not the replay's. So we attribute
+    by `graphId`, which is exact.
+
+    One graph is captured per batch size (all share the same node topology). We pick
+    the representative rank (min deviceId; TP is symmetric) and report each graph's
+    internal comm/compute split, replay count (kernels / distinct graph nodes), and
+    per-replay collective count. The graph with the most replays is the dominant
+    forward operating point. Comm% is share of summed GPU kernel time; TP all-reduce
+    is inline/serialized on the compute stream, so this ~= exposed comm within a step.
+    """
+    if not os.path.exists(sqlite_path):
+        print("  (no sqlite db next to REP; skip per-step graph decomposition)")
+        return
+    cur = sqlite3.connect(sqlite_path).cursor()
+    try:
+        dev = cur.execute(
+            "SELECT MIN(deviceId) FROM CUPTI_ACTIVITY_KIND_KERNEL"
+        ).fetchone()[0]
+    except sqlite3.OperationalError:
+        print("  (sqlite has no kernel table; skip)")
+        return
+    rows = cur.execute(
+        "SELECT k.graphId, s.value, k.end-k.start, k.graphNodeId "
+        "FROM CUPTI_ACTIVITY_KIND_KERNEL k JOIN StringIds s ON k.shortName=s.id "
+        "WHERE k.deviceId=? AND k.graphId IS NOT NULL",
+        (dev,),
+    ).fetchall()
+    if not rows:
+        print("  (no in-graph kernels -> CUDA graph disabled; use the kernel CSV "
+              "comm% above, not this structural split)")
+        return
+    g = {}
+    for gid, nm, dur, node in rows:
+        d = g.setdefault(gid, {"comm": 0, "comp": 0, "ci": 0, "nodes": set(), "k": 0})
+        d["k"] += 1
+        d["nodes"].add(node)
+        if COLLECTIVE_RE.search(nm):
+            d["comm"] += dur
+            d["ci"] += 1
+        else:
+            d["comp"] += dur
+    items = []
+    for gid, d in g.items():
+        npn = len(d["nodes"]) or 1
+        items.append((d["k"] / npn, gid, d["comm"] + d["comp"], d, npn))
+    items.sort(key=lambda x: -x[0])
+    total_replays = sum(int(r) for r, *_ in items)
+    print(f"  Per-forward-step comm proportion (structural, by CUDA graph; rank dev={dev}):")
+    print(f"    {'graph':>5} {'replays':>7} {'tot(ms)':>8} {'COMM%':>6} {'COMP%':>6} {'coll/step':>9}")
+    for replays, gid, tot, d, npn in items:
+        cp = 100 * d["comm"] / tot if tot else 0
+        print(f"    {gid:5d} {replays:7.0f} {tot/1e6:8.1f} {cp:6.1f} {100-cp:6.1f} "
+              f"{d['ci']/replays if replays else 0:9.1f}")
+    replays, gid, tot, d, npn = items[0]
+    print(f"    -> dominant forward graph {gid}: {100*d['comm']/tot:.1f}% comm within one "
+          f"forward step ({replays:.0f}/{total_replays} replays, "
+          f"~{d['ci']/replays:.0f} collectives/step)")
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         sys.exit("usage: parse_d1.py <REP-prefix>")
@@ -129,6 +210,8 @@ def main() -> None:
         print("  (run nsys stats --report nvtx_gpu_proj_sum first)")
     print("[nvtx_pushpop_sum]")
     nvtx_pushpop_summary(f"{rep}_nvtx_pushpop_sum.csv")
+    print("[graph_forward]  <-- per-forward-step comm % (structural, CUDA-graph)")
+    graph_forward_summary(f"{rep}.sqlite")
 
 
 if __name__ == "__main__":
