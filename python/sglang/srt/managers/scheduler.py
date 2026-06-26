@@ -1546,6 +1546,7 @@ class Scheduler(
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
+    # EVENT
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
@@ -2041,9 +2042,11 @@ class Scheduler(
                 routed_experts_start_len=recv_req.routed_experts_start_len,
                 return_indexer_topk=recv_req.return_indexer_topk,
                 eos_token_ids=self.model_config.hf_eos_token_id,
+
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
+                
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,

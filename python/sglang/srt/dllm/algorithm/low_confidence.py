@@ -79,6 +79,9 @@ class LowConfidence(DllmAlgorithm):
 
             with dllm_nvtx_range(f"dllm_forward.step{step}"):
                 out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+
+
+                
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             assert batch_size == forward_batch.input_ids.shape[0] // self.block_size
             dllm_nvtx_push(f"dllm_select.step{step}")

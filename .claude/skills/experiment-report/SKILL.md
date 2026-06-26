@@ -5,7 +5,7 @@ description: Lay out an experiment under experiments/, route scripts (repo) vs d
 
 # Experiment Layout, Storage, and Report Writing
 
-Conventions for this repo's dLLM-on-SGLang experiments. Two inseparable concerns: **where things live** (scripts in repo, data on CephFS, report in the experiment folder) and **how the report reads** (dense, Typora-friendly, metric-disciplined). Canonical examples to copy from: `notes/templates/experiment_report_template.md`, the full report `experiments/profiling/dllm/d1_comm_decomposition/README.md`, its scripts `run_d1.sh`/`parse_d1.py`, and the legacy `notes/experiment_20260619_d1_comm_decomposition.md`.
+Conventions for this repo's dLLM-on-SGLang experiments. Two inseparable concerns: **where things live** (scripts in repo, data on CephFS, report in the experiment folder) and **how the report reads** (dense, Typora-friendly, metric-disciplined). Canonical examples to copy from: `notes/templates/experiment_report_template.md`; the full reports `experiments/profiling/dllm/d1_comm_decomposition/README.md` and `experiments/profiling/dllm/d2_sk_amplification/README.md`; their scripts `run_d1.sh`/`parse_d1.py` and `run_d2.sh`/`drive_humaneval.py`/`parse_d2.py`/`plot_d2.py`.
 
 ## 1. Folder layout — one self-contained folder per experiment
 
@@ -56,11 +56,46 @@ The reader uses Typora; optimize the markdown source for it.
 - Parse nsys CSVs with `csv.DictReader` — kernel names contain commas; sqlite is the source of truth. Classify comm by op (`AllReduce`→TP, `AllToAll`→EP, `AllGather`→LM-head/vocab). Add derived sanity checks (e.g. forwards ≈ AllReduce_inst / (layers × collectives)).
 - **Always state the operating point** (batch/concurrency) next to every number; a metric without it is meaningless.
 
-## 6. Checklist before calling an experiment done
+## 6. Per-token vs per-forward distributions (do not conflate — this is the #1 review trap)
+
+A "per-token" cost is built from **one measurement per forward**: `(comm_time, comp_time, n_tokens_committed)` → per-token sample = `time / n_tokens`. Never approximate it as a block-level step-count × one global average — measure each forward and divide by the tokens *that* forward decoded.
+- **Per-forward ≠ per-token as distributions.** One forward decodes many tokens, so in a *per-token* view each forward must be **weighted by its `n` tokens** (a forward decoding 40 tokens represents 40 tokens). Per-forward = each forward one sample. They are different objects; never write "per forward = per token."
+- **Ratio of means ≠ mean of ratios.** The token-weighted mean (`Σtime / Σtokens`, the true average cost per delivered token) differs from the unweighted mean of per-forward `time/n` ratios (inflated by 1-token forwards). State which you report; default to token-weighted for "cost per delivered token."
+- **A ratio (e.g. comm fraction `comm/(comm+comp)`) is scale-free in VALUE** (the `n` cancels) **but its DISTRIBUTION still depends on weighting.** If you claim per-forward and per-token coincide, *show both* (overlaid/2-row) and say *why* (e.g. fraction ⊥ tokens-committed because comm/comp are set by batch size) — don't assert it.
+- **Report distributions, not point estimates.** These quantities are right-skewed (1-token forwards, desync tail) → histogram + **both mean and median**. A "typical..mean range" is a poor substitute for a histogram; the reviewer will (rightly) ask for the distribution.
+- **When an identity must hold, compute both sides at the same granularity.** e.g. `intrinsic_s_k + straggler_waste = batch_S_k` only if all three are block-weighted (repeat the call's `S_k` per block); mixing call-weighted and block-weighted breaks the identity and the figure.
+
+## 7. Figures are first-class — a `plot_<id>.py`, a `figures/`, and a stats JSON
+
+For any distribution or sweep result, **plot it**; tables and "x..y" ranges do not convey a distribution. Add `plot_<id>.py` beside `parse_<id>.py`.
+- **No-GPU, re-runnable:** `plot_<id>.py` reads the **saved** CSVs / `.sqlite` (never re-runs the model) and writes PNGs to the **repo** `experiments/<…>/<exp>/figures/` (small, versioned, referenced by the README with relative `figures/foo.png`). Pick one figures dir and use it everywhere — don't mix `figures/` and `assets/`.
+- **Single source of truth:** have `plot_<id>.py` (or the parser) also dump the headline scalars to a `*_dist_stats.json`; cite those in the report so table/figure/text can't drift. After editing numbers, re-grep the README for stale values and reconcile rounding against the figure's own formatting.
+- **For distributions:** histogram + mean (dashed) + median (dotted) annotated; label whether it is per-forward or per-token (and the weighting); note clipped tails (`N% > xmax, tail to …`) instead of letting a clip pile-up masquerade as a mode.
+- `matplotlib` may be absent in the env — `pip install matplotlib` once; use `matplotlib.use("Agg")`.
+
+## 8. Workload must be representative and GPU-bound
+
+A profiling number is only as good as its operating point.
+- **Drive a real dataset at sustained concurrency**, not a handful of hand-picked prompts in burst `curl`s. Use a load driver that keeps exactly `concurrency` requests in flight (cycling a real prompt set, e.g. HumanEval) so the running batch stays full; bound the nsys capture window to the steady state.
+- **Realized batch ≠ nominal concurrency.** Requests desync and finish staggered; log and report the realized batch-size mix (the counter's `batch_size` per forward), and confirm the capture is actually GPU-bound (dominant batch ≈ concurrency for a large fraction of forwards). At bs≈1 the dLLM loop is host-bound and every per-token/comm number is unrepresentative.
+- Issue more requests than the concurrency (e.g. `~4×`) so the batch is near-full for most of a short, trace-bounded capture rather than mostly ramp/drain.
+
+## 9. Process tips (cheap insurance against expensive re-runs)
+
+- **The data is method-independent; the parser is cheap.** Collect raw traces/CSVs once, then iterate parsing/plotting offline — never re-run the GPU job to fix an analysis bug.
+- **When a reviewer questions a method, MEASURE the answer, don't argue it** (e.g. per-replay CV to test "is one number valid"; per-forward-vs-per-token histograms to test a weighting claim). Bake the validation into the parser/figure so it's reproducible.
+- **Lead with the metric plan when asked (or when results get confusing):** a short table of *metric · level · unit · source · what-it-answers* before any numbers orients the reader; structure the Results section to mirror it.
+- **Flag superseded results loudly** (a blockquote at the top) when a re-run corrects an earlier number, and say exactly what was wrong and why.
+- `nsys` may not be on `PATH` in a non-interactive/`nohup` shell even if it works interactively — verify (`command -v nsys`) before launching a long background capture.
+
+## 10. Checklist before calling an experiment done
 
 - [ ] Scripts in `experiments/<family>/<subject>/<exp>/`; data under the mirrored `$DATA_ROOT/...` (nothing important in `/tmp` or `/root`).
 - [ ] `run_*.sh` is a single copy-pasteable entry point; records commit/model/GPU+interconnect/shape/concurrency.
+- [ ] Workload is a real dataset at sustained, GPU-bound concurrency; realized batch-size mix logged and reported (not assumed = nominal concurrency).
 - [ ] Report is the folder `README.md`, full (all template sections), not a `notes/` stub.
 - [ ] Every number labels its metric and states the operating point; comm numbers come from graph-ON node-trace, not eager.
+- [ ] Per-token vs per-forward stated explicitly (with weighting); distributions shown as histograms with **mean and median**, not a single number or a range; "per-forward = per-token" never asserted.
+- [ ] Figures generated by a no-GPU `plot_*.py` into `figures/`, referenced with relative paths; scalars sourced from one `*_dist_stats.json` so text/table/figure agree (re-grep for stale numbers).
 - [ ] Formatting: single-line bullets/paragraphs, ≤1 consecutive blank line (the `awk` check prints `1`).
-- [ ] Plan and any prior/compared report are cross-linked; family README index updated.
+- [ ] Plan and any prior/compared report are cross-linked; family README index updated; superseded results flagged.

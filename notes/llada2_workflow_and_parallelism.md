@@ -153,6 +153,53 @@ Two admission paths, both ultimately truncate the request to a single block alig
 
 Each admission calls `_update_prefill_budget()`, which decrements `rem_dllm_tokens -= extend_input_len` (`schedule_policy.py:599`). `budget_state()` returns `NO_TOKEN`/`OTHER` once `rem_dllm_tokens <= 0`, so the round admits at most `max_running_requests` blocks total (`schedule_policy.py:575`). This is why the per-round batch is bounded and block-aligned.
 
+### What "prefill" *means* for a dLLM request
+
+A common confusion: dLLM "prefill" is **not** a single forward over the whole prompt. The unit of scheduling is always one `block_size` block, so a prompt longer than `block_size` is prefilled **one block per round, across several rounds**, before any denoising happens. The PREFILL-vs-DECODE label is recomputed every round by `determine_dllm_phase()` (`mixin/req.py:40`), which inspects only the single block sitting immediately after the cached prefix:
+
+```python
+input_block = self.fill_ids[prefix_length : prefix_length + block_size]
+is_prefill_phase = self.dllm_config.mask_id not in input_block   # mixin/req.py:48
+```
+
+* **No `mask_id` in that block** → it is a slice of the raw prompt that only needs its KV populated → `STAGING_PREFILL`.
+* **`mask_id` present** → the block is (partly) the trailing `[MASK]` block being denoised → `STAGING_DECODE`.
+
+So "finishing prefill" for a request means: keep feeding full prompt blocks until the cached prefix reaches the end of the prompt; the round where the block after the prefix first contains a mask is the first **decode** round.
+
+### How the prefix grows between rounds (the missing link)
+
+`determine_dllm_phase()` and `_add_dllm_req()` both key off `len(prefix_indices)`, but `init_next_round()` runs `init_next_round_input()` **without** a tree cache for staging requests (`mixin/scheduler.py:352`), so it does **not** re-match the prefix. The prefix instead grows by exactly one block per round at the **top of the next `get_next_batch_to_run()`**: for every request still in the dLLM `staging_queue`, the scheduler calls `stash_chunked_request(req)` → `maybe_cache_unfinished_req(req, tree_cache, chunked=True)` (`scheduler.py:2512`, `:2462`). That inserts the block just computed into the radix tree and advances `req.prefix_indices` to cover it. `_update_block_offset_for_dllm()` then snaps `dllm_block_offset` up to the new `prefix_len` (`mixin/req.py:68`), keeping RoPE positions aligned. Net effect each round: **one freshly computed block becomes cached prefix, and `_init_fill_ids_for_dllm()` re-appends a new `[mask]*block_size` tail** (`mixin/req.py:56`).
+
+Note the masks `_init_fill_ids_for_dllm()` appends are *sliced back off* during pure-prefill rounds: `_add_dllm_req` truncates `fill_ids` to `prefix_len + trunc_len`, and while the prefix is still inside the prompt that cut lands before the appended mask block — so a prefill block carries no masks and hits the fast path below.
+
+### Worked example: prefilling an 80-token prompt (block_size = 32)
+
+Trailing `[mask]*32` is always appended, so masks live at positions `[80, 112)`. `floor(80/32) = 2` rounds prefill full prompt blocks; the leftover `80 mod 32 = 16` prompt tokens get absorbed into the first decode block.
+
+| Round | `block_offset` | `prefix_len` (after prior stash) | block examined `[prefix, prefix+32)` | phase | forward does | committed |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0 | 0 | prompt `[0,32)`, no mask | PREFILL | fast path: 1 forward, populate KV `[0,32)` | 0 |
+| 2 | 32 | 32 | prompt `[32,64)`, no mask | PREFILL | fast path: 1 forward, populate KV `[32,64)` | 0 |
+| 3 | 64 | 64 | `[64,80)` prompt + `[80,96)` mask | **DECODE** | denoising loop: 16 masks, `start=32−16=16` | 16 |
+| 4 | 96 | 96 | `[96,128)` all mask | DECODE | denoising loop: 32 masks | 32 |
+| … | | | | DECODE | … until EOS / max_new | |
+
+Reading the table: rounds 1–2 are pure prefill (the request never leaves `get_prefill_requests()` because its block has no mask). Round 3 is where prefill "finishes" — the last 16 prompt tokens and the first 16 mask tokens share one block, so the model ingests prompt tail **and** denoises in the same forward (the semi-autoregressive boundary). If the prompt were an exact multiple of `block_size`, prefill would take exactly `L/block_size` pure-prefill rounds and round `L/block_size + 1` would be the first all-mask decode block.
+
+### The prefill forward itself: the fast path
+
+A prefill round produces a batch whose `input_ids` contain **no** `mask_id`, so `LowConfidence.run()` takes its fast path (`low_confidence.py:41`):
+
+```python
+mask_index = forward_batch.input_ids == self.mask_id
+if torch.sum(mask_index).item() == 0:          # pure prefill block
+    out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+    return out.logits_output, [], out.can_run_graph   # next_token_ids = []
+```
+
+One forward, KV for the block is written into the pool, and `next_token_ids` is **empty** — a prefill round commits zero output tokens. Back in `process_batch_result_dllm()` the per-request `new_tokens == 0` branch simply `continue`s (`mixin/scheduler.py:79`): nothing is written to `output_ids`, `check_finished` is not run, and the request stays in the staging queue for its next block. Only once the request reaches a decode block (round 3 above) does the denoising loop run and `next_token_ids` carry the committed positions, which `process_batch_result_dllm()` writes into the tail of `fill_ids` and appends to `output_ids` (`mixin/scheduler.py:82`).
+
 ### `prepare_for_extend()`: from `fill_ids` to device tensors
 
 `prepare_for_extend()` (`python/sglang/srt/managers/schedule_batch.py:1688`) sets `forward_mode = DLLM_EXTEND` for dLLM, then builds the extend tensors exactly like a normal extend:
@@ -208,6 +255,10 @@ flowchart TD
 | Two manager queues        | `python/sglang/srt/dllm/mixin/scheduler.py:282`              |
 | Per-round block append    | `python/sglang/srt/dllm/mixin/req.py:56`, `python/sglang/srt/managers/schedule_batch.py:982` |
 | Phase recompute           | `python/sglang/srt/dllm/mixin/req.py:40`                     |
+| Prefix grows (stash block)| `python/sglang/srt/managers/scheduler.py:2512`, `:2462`     |
+| Block-offset realign      | `python/sglang/srt/dllm/mixin/req.py:68`                     |
+| Prefill fast-path forward | `python/sglang/srt/dllm/algorithm/low_confidence.py:41`     |
+| Zero-token result skip    | `python/sglang/srt/dllm/mixin/scheduler.py:79`              |
 | `get_new_batch_dllm` body | `python/sglang/srt/dllm/mixin/scheduler.py:29`               |
 | Round budget init         | `python/sglang/srt/managers/schedule_policy.py:483`          |
 | Incoming admission        | `python/sglang/srt/managers/schedule_policy.py:618`          |
@@ -221,6 +272,97 @@ flowchart TD
 
 
 
+
+## Batching Multiple dLLM Requests (batch_size > 1)
+
+This section answers: *given several active requests in different phases, which ones run together in one `DLLM_EXTEND` batch, and what does `LowConfidence` do with them?* The short answer is a single rule with one surprising consequence.
+
+### The core scheduling rule: prefill-priority, phase-homogeneous rounds
+
+Every round, `_process_dllm_batches()` partitions the manager's `waiting_queue` by phase and picks **one** family (`mixin/scheduler.py:149`):
+
+```python
+prefill_reqs = self.dllm_manager.get_prefill_requests()   # is_dllm_prefill() == True
+if prefill_reqs:
+    self._process_batch_by_phase(adder, prefill_reqs, STAGING_PREFILL, INCOMING_PREFILL)
+else:
+    decode_reqs = self.dllm_manager.get_decode_requests()  # everything else
+    self._process_batch_by_phase(adder, decode_reqs, STAGING_DECODE, INCOMING_DECODE)
+```
+
+Two invariants follow:
+1. **A batch is never mixed prefill+decode.** If *any* queued request is in a prefill phase, the entire round is a prefill round and all decode requests are skipped that round.
+2. **Within the chosen family, staging requests are admitted before incoming ones** (`_process_batch_by_phase`, `mixin/scheduler.py:174`): a request that already holds KV from a prior round (`add_dllm_staging_req`) gets a slot before a brand-new one (`add_one_req`). The batch can therefore mix `STAGING_PREFILL` + `INCOMING_PREFILL`, or `STAGING_DECODE` + `INCOMING_DECODE`, but never crosses the prefill/decode line.
+
+Batch size for the round is bounded by `get_num_allocatable_reqs(running_bs)` and the `rem_dllm_tokens = max_running_requests * block_size` budget — so at most `max_running_requests` blocks per round (`mixin/scheduler.py:244`, `schedule_policy.py:483`).
+
+### Your scenario: 1 prefill + 3 decode requests
+
+Say the manager's `waiting_queue` holds `[P, D1, D2, D3]` — `P` is a freshly admitted request still prefilling its prompt (`STAGING_PREFILL`), `D1–D3` are older requests mid-generation (`STAGING_DECODE`). They are **not** scheduled together:
+
+```mermaid
+flowchart TD
+  A["waiting_queue = [P(prefill), D1, D2, D3 (decode)]"] --> B{"get_prefill_requests() nonempty?"}
+  B -->|"yes: [P]"| C["PREFILL round: can_run_list = [P], batch_size = 1<br/>fast path: 1 forward, populate KV for P's block<br/>D1,D2,D3 STALL this round"]
+  C --> D{"next round: is P still prefilling?"}
+  D -->|"yes (long prompt)"| B
+  D -->|"no (P's block now has masks)"| E["get_prefill_requests() empty"]
+  E --> F["DECODE round: can_run_list = [P, D1, D2, D3], batch_size = 4<br/>LowConfidence denoising loop runs all 4 blocks together"]
+```
+
+So while `P` is prefilling, each round is a **prefill round of batch_size 1** (just `P`), and `D1–D3` wait. Only once `P` reaches a decode block (the block after its cached prefix contains `mask_id`) does `get_prefill_requests()` return empty, and then all four denoise together as a batch_size-4 decode round.
+
+**Consequence worth flagging for optimization work:** a long prompt takes `ceil(prompt_len / block_size)` prefill rounds, and *every one of them blocks the decode requests*. Each prefill round is cheap (one fast-path forward, no denoising loop), so the throughput cost is small, but the **decode latency** of `D1–D3` is inflated by the number of prefill rounds any new arrival needs. This is the dLLM analogue of prefill-vs-decode interference; mixing or interleaving phases (or chunking the prefill priority) is a natural scheduling-optimization target in this repo.
+
+### Inside a decode batch of size N: batched denoising and stragglers
+
+Once a homogeneous decode batch `[B0…B_{N-1}]` reaches `LowConfidence.run()`, all N blocks denoise **in lockstep** (`low_confidence.py:71`). Each loop iteration runs **one** `model_runner.forward()` over the whole `N * block_size` token tensor, then the per-block selection loop commits tokens block-by-block. Key behaviors when N > 1:
+
+* **Blocks finish at different steps.** Each block commits the positions whose confidence clears `threshold` (or its single most-confident position), so a block with easy/high-confidence tokens empties its masks in fewer steps than a hard one. A block that is already mask-free is detected (`block_mask_index.sum()==0`) and `continue`d in the selection loop (`low_confidence.py:92`) — **but the shared loop keeps re-running `model_runner.forward()` over the full batch until the *slowest* block is mask-free** (or `block_size` steps elapse, `low_confidence.py:71-74`). Finished blocks are thus recomputed for free — a straggler effect that wastes compute proportional to the spread in per-block difficulty.
+* **Per-request output length varies.** `start_list[i] = block_size − (#masks in block i)` differs per block, so the returned `next_token_ids_list[i] = block_i[start_i:]` has a per-request length (`low_confidence.py:57`, `:146`). `process_batch_result_dllm()` writes each request's slice independently (`mixin/scheduler.py:82`).
+* **Different `dllm_block_offset` per request is fine.** Each request sits at its own absolute position range `[offset_i, offset_i+block_size)` (the positions override, `forward_batch_info.py:538`), and attention reads each request's own cached prefix length. Requests at completely different points in their generation still share one batch.
+* **Finished requests (EOS) drop out next round.** `process_batch_result_dllm` runs `check_finished` and frees KV (`mixin/scheduler.py:86-90`); `filter_finished_reqs()` removes them from both manager queues at the top of the next `get_next_batch_to_run` (`scheduler.py:2507`), shrinking the batch. CUDA-graph replay just picks the smaller batch-size bucket.
+
+### All batch_size > 1 cases, enumerated
+
+| Waiting-queue composition this round | Round formed | batch_size | `LowConfidence` path | Notes |
+| --- | --- | --- | --- | --- |
+| k incoming prefill reqs (prompt ≥ 1 block) | PREFILL | k | fast path (no masks) | one forward populates one prompt block of KV per req |
+| staging prefill (long prompt mid-prefill) + incoming prefill | PREFILL | staging + incoming | fast path | staging admitted first; both are pure prompt blocks |
+| n staging decode, similar mask counts | DECODE | n | denoising loop, near-lockstep | the efficient case — little straggler waste |
+| n staging decode, uneven mask counts / confidence | DECODE | n | denoising loop until slowest | easy blocks idle-recomputed until the hardest finishes |
+| staging decode at different `block_offset`s | DECODE | n | denoising loop | per-req positions + per-req prefix; runs fine together |
+| incoming decode (prompt < block_size) + staging decode | DECODE | mix | denoising loop | short prompts skip prefill entirely and join decode directly (`mixin/req.py:26`) |
+| **any prefill pending + any decode pending** | **PREFILL only** | prefill count | fast path | **decode reqs stall until no prefill remains (the scenario above)** |
+| a req hits EOS mid-batch | (next round) | n−1 | — | finished req filtered out; batch shrinks |
+
+The single mental hook: **dLLM rounds are phase-pure and prefill wins.** Decode requests batch together and denoise in lockstep (paying a straggler cost for uneven blocks); a prefill request never joins a decode batch — it forces its own prefill round(s) first.
+
+### Why phase-pure, prefill-first? (two separate decisions)
+
+It is tempting to explain prefill-priority as "prefill is one forward, decode is many, so do the cheap thing first." That conflates two distinct choices; only the first is about redundant compute.
+
+**1. Phase separation (the redundancy argument).** `LowConfidence.run` denoises a batch in **lockstep**: every `model_runner.forward()` covers all blocks, and the loop runs until the *slowest* block is mask-free (`low_confidence.py:71-74`). A finished block is skipped only in the post-forward *selection* (`continue`, `low_confidence.py:92`) — it is still dragged through every forward. So if a no-mask prefill block were mixed into a decode batch, the whole-batch fast-path check `sum(mask_index)==0` would fail (decode masks present), and that prefill block — which needs **1** forward — would be re-forwarded **(decode_steps + 1)** times for nothing. Keeping rounds phase-pure lets the prefill block take the fast path (one forward, `low_confidence.py:41`) and exit. This is the redundancy avoidance — and note it argues for *separating* phases, not for any particular order.
+
+**2. Prefill-first ordering (a readiness heuristic, not a compute result).** Given phases must be separate, choosing prefill before decode (`mixin/scheduler.py:149`) is justified differently: a request cannot decode until its prompt KV exists, so prefilling first moves new arrivals into the decode pool sooner; and a prefill round is a single cheap forward, so it delays decode only briefly per round. The cost is **decode starvation** — a long prompt forces `ceil(prompt_len/block_size)` prefill rounds, each stalling all decode requests. Prefill-first is thus a greedy readiness policy, not a proof of optimality.
+
+**Contrast with conventional serving.** Normal SGLang does the opposite: continuous batching deliberately **mixes** prefill and decode in one batch (chunked prefill) to keep the GPU saturated. dLLM cannot do that cheaply because the denoising loop is lockstep — a mixed batch either loses the fast path or needs mid-loop batch shrinking (not implemented). So the dLLM scheduler is genuinely *simpler*: phase-pure rounds, prefill-first.
+
+**Residual redundancy.** Scheduling only removes the prefill-vs-decode form of waste. The **straggler waste inside a decode batch remains**: easy blocks finish early but are re-forwarded until the hardest block resolves. Shrinking the batch as blocks finish, or grouping blocks by expected difficulty, is a live optimization target.
+
+### Anchor summary (multi-request batching)
+
+| Behavior | File reference |
+| --- | --- |
+| Phase partition + prefill-priority | `python/sglang/srt/dllm/mixin/scheduler.py:149` |
+| Prefill/decode queue filters | `python/sglang/srt/dllm/mixin/scheduler.py:299`, `:303` |
+| Staging-before-incoming within a phase | `python/sglang/srt/dllm/mixin/scheduler.py:174` |
+| Batch-size cap / allocatable check | `python/sglang/srt/dllm/mixin/scheduler.py:244` |
+| Short prompt starts in decode | `python/sglang/srt/dllm/mixin/req.py:26` |
+| Lockstep denoising loop over N blocks | `python/sglang/srt/dllm/algorithm/low_confidence.py:71` |
+| Finished-block skip (straggler) | `python/sglang/srt/dllm/algorithm/low_confidence.py:92` |
+| Per-req variable output slice | `python/sglang/srt/dllm/algorithm/low_confidence.py:146` |
+| EOS filter between rounds | `python/sglang/srt/managers/scheduler.py:2507` |
 
 ## One-Screen Mental Model
 

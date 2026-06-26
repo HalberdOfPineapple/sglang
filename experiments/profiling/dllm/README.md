@@ -28,7 +28,8 @@ Override `DATA_ROOT` (whole tree) or `OUT` (one experiment) to relocate.
 | Exp | Folder | Distributed question |
 |---|---|---|
 | **D1** | `d1_comm_decomposition/` | exposed-comm fraction & TP/EP/DP split per denoising step |
-| **D2** | `d2_sk_amplification/` | comm-per-output-token vs AR (`S_k`× penalty) |
+| **D2** | `d2_sk_amplification/h100/` | comm-per-output-token vs AR (`S_k`× penalty), 4×H100 NVLink |
+| **D2** | `d2_sk_amplification/a100/` | same on 4×A100 (+bs=1): comm projected from volume onto A100 NVLink vs measured A100 compute (comm fraction) |
 | D3 | _(todo)_ | strong scaling across TP shapes |
 | D4 | _(todo)_ | EP all-to-all volume & expert-load drift across steps |
 | D5 | _(todo)_ | DP-attention gather/scatter cost in the loop |

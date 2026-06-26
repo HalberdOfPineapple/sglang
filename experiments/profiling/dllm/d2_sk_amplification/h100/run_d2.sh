@@ -2,7 +2,7 @@
 # D2 — S_k x amplification: exposed comm/comp per OUTPUT TOKEN, measured PER STEP.
 # (see experiments/profiling/dllm/dllm_baseline_profiling_plan.md, D2.)
 #
-# Report: experiments/profiling/dllm/d2_sk_amplification/README.md
+# Report: experiments/profiling/dllm/d2_sk_amplification/h100/README.md
 #
 # Method (rigorous redo): for every denoising forward we record, with the §3
 # counter (SGLANG_DLLM_PROFILE=1), the batch_size and the tokens committed THAT
@@ -13,12 +13,12 @@
 # concurrency so the batch stays full (GPU-bound). Swept over concurrency 4/8/16.
 #
 # Scripts in repo (this dir); OUTPUTS (profiles, CSVs, logs = data) mirror to:
-#   data : $DATA_ROOT/profiling/dllm/d2_sk_amplification/{profiles,logs}/
+#   data : $DATA_ROOT/profiling/dllm/d2_sk_amplification/h100/{profiles,logs}/
 set -uo pipefail
 
 REPO=${REPO:-/root/sglang_a100/sglang}
 DATA_ROOT=${DATA_ROOT:-/cephfs/shared/wxli/sglang-dllm}
-EXP_PATH=${EXP_PATH:-profiling/dllm/d2_sk_amplification}
+EXP_PATH=${EXP_PATH:-profiling/dllm/d2_sk_amplification/h100}
 OUT=${OUT:-$DATA_ROOT/$EXP_PATH}
 PROF=${PROF:-$OUT/profiles}
 LOGS=${LOGS:-$OUT/logs}
