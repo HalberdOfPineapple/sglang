@@ -15,8 +15,9 @@ Target: Phase A correctness (eager, with DC+, single GPU)
 > **UPDATE (2026-06-30):** the host-side math is now paper-correct and tested
 > (the N_σ-in-budget bug is FIXED; selection/compaction match the official
 > kernels and are unit-pinned — plan §0.1). The only remaining gap to real FLOPs
-> savings is the split forward, now specified via FlashInfer custom `kv_indices`
-> (plan §8) — paper-exact with **no** custom Triton kernel.
+> savings is the split forward, now specified via per-phase `seq_lens` +
+> contiguous-prefix KV compaction (plan §8, R1 resolved) — paper-exact with **no**
+> custom Triton kernel and no page_size change.
 
 ## Implementation Checklist
 
