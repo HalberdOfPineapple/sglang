@@ -10,10 +10,13 @@ Target: Phase A correctness (eager, with DC+, single GPU)
 > therefore NOT a real FOCUS implementation. The paper's compute win comes from
 > physically evicting tokens after Layer 1 and running L1-attn..L on `|S| ≪ B`.
 > The paper-exact reduced forward is specified in
-> **`notes/focus_paper_exact_plan.md`** — that is the source of truth for the
-> next session. Also note a known bug: `compute_retention_budget` folds N_σ into
-> the budget, but the official kernel does NOT (N_σ is a selection-time
-> expansion). See the plan §1.
+> **`notes/focus_paper_exact_plan.md`** — that is the source of truth.
+>
+> **UPDATE (2026-06-30):** the host-side math is now paper-correct and tested
+> (the N_σ-in-budget bug is FIXED; selection/compaction match the official
+> kernels and are unit-pinned — plan §0.1). The only remaining gap to real FLOPs
+> savings is the split forward, now specified via FlashInfer custom `kv_indices`
+> (plan §8) — paper-exact with **no** custom Triton kernel.
 
 ## Implementation Checklist
 

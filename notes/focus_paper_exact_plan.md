@@ -1,11 +1,40 @@
 # FOCUS Paper-Exact Reduced Forward — Handoff Plan (for next session)
 
 **Branch:** `feature/focus-implementation`
-**Status:** Phase A (logit-masking) landed + validated, but it saves **zero FLOPs**
-(runs all B tokens through every layer; only gates which positions may commit).
-This note specifies the **paper-exact reduced forward** that actually evicts
-tokens after Layer 1 so layers 1-attn..L run on `|S| ≪ B` tokens. Single A100,
+**Status:** Phase A (logit-masking) landed earlier — saves **zero FLOPs**. Since
+then, the host-side math is now paper-correct and the compaction machinery is
+built/tested (see §0.1). The remaining work is the split forward + per-phase
+attention metadata, specified in §8 (the new, better approach: FlashInfer custom
+`kv_indices` page tables — NO custom Triton kernel needed). Single A100,
 LLaDA2.0-mini, TP=1, eager first (CUDA graph later).
+
+---
+
+## 0.1 Progress update (2026-06-30) — what's now DONE and tested
+
+- **Budget/selection corrected to match the official kernels** (was a real bug):
+  - `compute_focus_targets` (focus_utils.py): `target=min(len,max(⌈α·max(avg,1)⌉,1))`
+    — **N_σ removed from the budget** (the old `compute_retention_budget` folded
+    it in, which was wrong).
+  - `compute_should_evict`: `(target>0)&(mask_len>target)`.
+  - `select_and_enforce_constraints`: faithful port of
+    `focus_select_and_enforce_ragged` — top-`target` by ΔI OR all `ΔI≥mean+std`
+    candidates when `≥target` of them (the N_σ expansion), AR-context via block
+    adjacency, placeholder integrity gated by `block_progress`, min-keep;
+    non-masked processing positions always retained. Returns processing-set
+    retain mask + sorted retained block indices.
+  - Tests: `test_focus_utils.py`, `test_focus_selection_logic.py` (adds an N_σ
+    threshold-OR-topk pinning test + placeholder progress-gate test). Green.
+- **State compaction built + tested** (`focus_reduce.py`):
+  `build_retained_index` (per-request maps → global gather index + new
+  extend_seq_lens), `focus_compact_states` (index_select over flat batch;
+  mirrors official fused `focus_compact_states`), `cu_seqlens_from_lens`. Test
+  `test_focus_reduce.py` vs double-loop oracle + α→∞ identity. Green.
+- `Focus.run` updated to the new targets/should_evict API (still logit-masking
+  realization — the split forward in §8 replaces the per-step full forward).
+
+Net: every host-side decision FOCUS makes is now paper-exact and unit-pinned.
+The ONLY remaining gap to real FLOPs savings is the split forward (§8).
 
 ---
 
@@ -159,16 +188,93 @@ Mirror `graph_runner.py`: eager prefix, capture suffix keyed on rounded |S|
 - `experiments/dllm/focus_a100_smoke/`: launch+diff harness (α→∞==LowConfidence).
 
 ## 5. First actions next session (ordered)
-1. Fix budget/selection split to match official kernels (§1 budget bug). Re-run
-   `test_focus_selection_logic` + add a test pinning the kernel's
-   "threshold-OR-topk" rule.
-2. Port `focus_compact_states` + a torch oracle test (cheapest real kernel).
+**Steps 1-2 are DONE (see §0.1). Start at step 3, and follow §8 (the refined
+FlashInfer-kv_indices approach) rather than the §3 Triton-sparse-kernel route —
+§8 is paper-exact AND avoids porting the 900-line kernel.**
 3. Add `forward_only_fill_kv`-equivalent to SGLang flashinfer backend (write KV
-   without computing attention output) — prerequisite for prefix.
-4. Build `forward_focus_prefix/suffix` with the **compacted-KV interim** first
-   (writes |S| KV to fresh slots, standard reduced extend) to get the split +
-   anchor green and measure real latency drop; THEN swap to sparse ragged paged
-   attention for paper-exactness (no L1 full-block-KV approximation).
-   - NB: the compacted-KV interim has ONE approximation (retained attend retained
-     at L1, not full block). It is exact at α→∞. Use it only to de-risk the split
-     plumbing; the paper-exact target is the ragged sparse path in step 1/§3.
+   without computing attention output) — prerequisite for the prefix (§8 Phase P).
+4. Build `forward_focus_prefix` (Phase P) / `forward_focus_suffix` (Phases A1+S)
+   on LLaDA2 with per-phase FlashInfer `kv_indices` (§8). FIRST resolve the page
+   granularity risk (R1: `page_size=block_size` ⇒ block-granular pages; retained
+   KV needs token-level indices — confirm the FlashInfer paged wrapper supports it).
+5. Wire into `Focus.run`; validate α→∞ == LowConfidence on the smoke harness; log
+   `Σ|S|/(B·batch)` redundancy + per-iter latency vs LowConfidence.
+6. (Last) CUDA-graph capture of Phase S keyed on rounded |S|.
+
+> The §3/§4 "compacted-KV interim with an L1 approximation" is now SUPERSEDED by
+> §8 (custom kv_indices), which is paper-exact with no approximation and no new
+> kernel. Prefer §8.
+
+---
+
+## 8. Split forward via FlashInfer custom kv_indices (REFINED approach — 2026-06-30)
+
+**Key discovery:** SGLang's paged attention reads KV through a `kv_indices` page
+table built in `init_forward_metadata` (flashinfer_backend.py, the dLLM-extend
+branch builds `kv_indptr`/`kv_indices` over `seq_lens`). We can make retained
+queries attend EXACTLY the retained KV slots by handing FlashInfer a **custom
+kv_indices** that lists only the wanted pages — **no custom Triton sparse kernel
+needed** (this supersedes §3's "port ragged_paged_attention_fwd" assumption).
+dLLM uses `page_size = block_size`, so pages are block-granular; for true
+per-token sparsity the retained-KV phase may need a page_size=1 wrapper or a
+per-token kv index. Confirm page granularity first (server_args forces
+`page_size=block_size`; may need a FOCUS-specific paged wrapper with token-level
+indices, which FlashInfer supports via `paged_kv_indices`/`last_page_len`).
+
+**Why this is paper-exact (no L1 approximation):** the only thing that differs
+between the L1-attention phase and the L2..L phase is *which KV slots are listed*
+in kv_indices. So run the suffix as TWO metadata regimes:
+
+Per denoising step (decode), focus_enabled & evictable — 3 phases, each its own
+attention metadata (reuse `forward_split_prefill`'s `reinit_attn_backend=True`
+pattern, model_runner.py:3254, to rebuild metadata between phases):
+
+- **Phase P (prefix): L0 full + L1 QKV.** Metadata = normal full-block dLLM
+  extend (q=B, kv=context+B). Run L0 fully (its attention writes L0 KV + collects
+  I0 via the existing side-channel). For L1: compute input_layernorm + QKV + RoPE
+  on the full block, **write full-block L1 KV to the block's original slots**
+  (KV-fill-only — Task 3), collect I1. Do NOT run L1 attention yet. Return
+  hidden(B), residual(B), q1(B), I0, I1.
+- Host: ΔI, targets, should_evict, select → retained block indices `S`;
+  `build_retained_index` → keep_index, new_lens; `focus_compact_states` →
+  hidden(|S|), residual(|S|), q1(|S|), positions(|S|).
+- **Phase A1 (L1 attention only): q=|S|, kv = context + FULL block L1 slots.**
+  Build kv_indices listing the request's context pages + ALL B block slots (the
+  full-block L1 KV written in Phase P). Run L1 attention (read-only; save_kv=False)
+  → L1 MLP on |S|. This is paper-exact: retained queries attend the full block.
+- **Phase S (L2..L): q=|S|, kv = context + RETAINED block slots.** Each layer's
+  attention writes its KV to the retained tokens' ORIGINAL block slots
+  (out_cache_loc = keep_index mapped to cache locs), and reads kv_indices =
+  context pages + the |S| retained block slots. Evicted slots are never read
+  (paper-exact). Final norm + lm_head on |S|.
+- Host: scatter |S| logits back to block positions (retained_to_block_map),
+  commit decodable, update n_bar/rightmost/uncached.
+
+**Anchor:** α→∞ ⇒ should_evict False ⇒ |S|=B ⇒ keep_index=identity ⇒ all three
+phases collapse to the full forward ⇒ generations == LowConfidence. This is the
+gate for the split.
+
+**Implementation order (revised):**
+1. (DONE) host math + compaction.
+2. KV-fill-only attention call (Task 3): a backend method that writes K,V to the
+   cache at `out_cache_loc` without computing attention output. For FlashInfer,
+   this is the `save_kv_cache` write path without the wrapper.forward — factor it
+   out of `forward_extend`.
+3. `LLaDA2MoeModel.forward_focus_prefix` (Phase P) + `forward_focus_suffix`
+   (Phases A1+S). Split L1 inside `LLaDA2MoeAttention` into `qkv_rope_fill` and
+   `attention_from_q` halves (mirror official forward_focus_qkv_and_evict /
+   forward_focus_attention).
+4. Per-phase metadata builder: a helper that, given keep_index + which block
+   slots to expose (full vs retained), produces the FlashInfer wrapper
+   plan/`kv_indices`. Verify against a 1-request micro-test (q=|S|<B, kv=context+B)
+   comparing reduced-attention output to the full-forward's retained rows.
+5. Wire into `Focus.run`; validate α→∞ anchor on the smoke harness; log
+   `Σ|S|/(B·batch)` redundancy + per-iter latency vs LowConfidence.
+6. (Last) CUDA graph capture of Phase S keyed on rounded |S|.
+
+**Risks:** (R1) page granularity — `page_size=block_size` means block-granular
+pages; per-token retained KV may need a token-level paged wrapper. Resolve first.
+(R2) two metadata rebuilds per step in the hot loop — measure overhead; acceptable
+eager, optimize later. (R3) out_cache_loc bookkeeping for retained slots across
+L2..L — keep retained tokens at their ORIGINAL block KV slots so positions/RoPE
+stay correct; only the query set and kv_indices shrink.
