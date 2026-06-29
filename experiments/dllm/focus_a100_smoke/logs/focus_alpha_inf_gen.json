@@ -1,0 +1,22 @@
+[
+  {
+    "idx": 0,
+    "prompt": "Question: What is 17 + 26? Answer with just the number.",
+    "text": "\n43"
+  },
+  {
+    "idx": 1,
+    "prompt": "Write a one-sentence definition of a diffusion language model.",
+    "text": "\n\nA diffusion language model is a type of artificial intelligence model that generates text by iteratively denoising random data conditioned on learned language patterns."
+  },
+  {
+    "idx": 2,
+    "prompt": "Complete the function:\n\ndef add(a, b):\n    return",
+    "text": " a + b\n```\n\nThis function takes two arguments `a` and `b` and returns their sum."
+  },
+  {
+    "idx": 3,
+    "prompt": "List the first five prime numbers separated by commas.",
+    "text": "  \n**Answer:** 2, 3, 5, 7, 11"
+  }
+]

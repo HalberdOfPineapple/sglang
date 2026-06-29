@@ -145,9 +145,13 @@ def compute_retention_budget(
             budgets.append(1)
             continue
 
-        # Statistical threshold: μ + σ (1σ above mean)
-        threshold = delta_I_masked.mean() + delta_I_masked.std()
-        N_sigma = (delta_I_masked >= threshold).sum().item()
+        # Statistical threshold: μ + σ (1σ above mean). With a single masked
+        # token std is undefined; treat that token as above-threshold (N_σ=1).
+        if len(delta_I_masked) == 1:
+            N_sigma = 1
+        else:
+            threshold = delta_I_masked.mean() + delta_I_masked.std()
+            N_sigma = (delta_I_masked >= threshold).sum().item()
 
         # Base budget from historical average
         base_budget = math.ceil(alpha * avg_decoded[b].item())

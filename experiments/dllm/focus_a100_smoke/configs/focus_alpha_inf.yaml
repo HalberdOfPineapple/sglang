@@ -1,0 +1,11 @@
+# FOCUS with alpha -> inf: budget K saturates to block_size every step, so NO
+# eviction occurs and FOCUS must behave identically to LowConfidence. Used as the
+# end-to-end correctness anchor (compare generations against LowConfidence).
+block_size: 32
+threshold: 0.9
+alpha: 1000000000.0
+maxpool_k: 3
+min_retain: 1
+importance_layers: [0, 1]
+enable_delayed_cache: true
+n_bar_init: 1.0

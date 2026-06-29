@@ -1,0 +1,22 @@
+[
+  {
+    "idx": 0,
+    "prompt": "Question: What is 17 + 26? Answer with just the number.",
+    "text": "\n\n43"
+  },
+  {
+    "idx": 1,
+    "prompt": "Write a one-sentence definition of a diffusion language model.",
+    "text": "\n\nA diffusion language model is a type of artificial intelligence model that generates text by iteratively denoising a random process, learning the underlying distribution of language to produce coherent and contextually relevant text."
+  },
+  {
+    "idx": 2,
+    "prompt": "Complete the function:\n\ndef add(a, b):\n    return",
+    "text": " a + b\n```\n\nThis function takes two arguments `a` and `b` and returns their sum. It's simple and works for any numeric types (integers, floats, etc.).\n\nExample usage:\n```python\nprint(add(3, 5))        # Output: 8\nprint(add(2.5, 3.7))    # Output: 6.2\nprint(add(-1, 1))       # Output: 0\n```\n\n\u2705 The function is complete and correct."
+  },
+  {
+    "idx": 3,
+    "prompt": "List the first five prime numbers separated by commas.",
+    "text": "  \n**Answer:** 2, 3, 5, 7, 11"
+  }
+]
