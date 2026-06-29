@@ -139,3 +139,19 @@ tracking cumulative stats locally within a single `run()` call (correct for
 budgeting within a block-batch; cross-call persistence is a Phase C item).
 
 See `notes/focus_implementation_summary.md` for the full roadmap.
+
+### 2026-06-30: Host-side correctness + compaction + de-risked split-forward plan
+- **Fixed budget/selection** to match official kernels (Task 1): `compute_focus_targets`
+  (no N_σ in budget), `compute_should_evict`, `select_and_enforce_constraints`
+  (top-target OR N_σ mean+std expansion, AR-context adjacency, placeholder
+  progress-gate). Rewrote `test_focus_utils.py` + `test_focus_selection_logic.py`
+  (adds N_σ threshold-OR-topk pin). `Focus.run` uses new API.
+- **Built state compaction** (Task 2): `focus_reduce.py` (build_retained_index,
+  focus_compact_states, cu_seqlens_from_lens) + `test_focus_reduce.py` vs oracle.
+- **De-risked the split forward**: R1 resolved — SGLang FlashInfer dLLM extend uses
+  token-granular kv_indices (req_to_token contiguous slice), so paper-exact needs
+  NO custom Triton kernel / NO page_size change. Mechanism = per-phase seq_lens +
+  contiguous-prefix KV compaction (plan §8). KV-fill-only = direct set_kv_buffer
+  (Task 3 needs no new method).
+- All 5 FOCUS test files green. Remaining: the split forward itself (Task 4/5),
+  a large end-to-end change requiring model-in-the-loop debugging — NOT started.

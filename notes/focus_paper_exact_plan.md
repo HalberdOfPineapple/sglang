@@ -192,8 +192,12 @@ Mirror `graph_runner.py`: eager prefix, capture suffix keyed on rounded |S|
 **Steps 1-2 are DONE (see §0.1). Start at step 3, and follow §8 (the refined
 FlashInfer-kv_indices approach) rather than the §3 Triton-sparse-kernel route —
 §8 is paper-exact AND avoids porting the 900-line kernel.**
-3. Add `forward_only_fill_kv`-equivalent to SGLang flashinfer backend (write KV
-   without computing attention output) — prerequisite for the prefix (§8 Phase P).
+3. (SIMPLIFIED — no new method) KV-fill-only is just a direct
+   `forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v,
+   layer.k_scale, layer.v_scale)` call (same line the flashinfer backend uses at
+   flashinfer_backend.py:887). In the prefix, after L1 QKV+RoPE, call it to write
+   the full-block L1 KV; then run L1 attention on the reduced set with
+   `save_kv_cache=False`. No backend surgery needed.
 4. Build `forward_focus_prefix` (Phase P) / `forward_focus_suffix` (Phases A1+S)
    on LLaDA2 with per-phase FlashInfer `kv_indices` (§8). FIRST resolve the page
    granularity risk (R1: `page_size=block_size` ⇒ block-granular pages; retained
