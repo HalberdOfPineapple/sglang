@@ -114,7 +114,7 @@ def compute_importance_side_channel(
     if len(importance_list) == 0:
         return torch.empty(0, dtype=q.dtype, device=q.device)
 
-    return torch.cat(importance_list)
+    return torch.cat(importance_list) # [batch_size * block_size] (total_tokens)
 
 
 def compute_retention_budget(

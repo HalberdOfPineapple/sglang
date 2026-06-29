@@ -4,6 +4,17 @@ Branch: `feature/focus-implementation`
 Start Date: 2026-06-29
 Target: Phase A correctness (eager, with DC+, single GPU)
 
+> ⚠️ **CRITICAL (2026-06-29, post-review):** the "Phase A" below is a
+> **logit-masking** realization that reproduces FOCUS's *decoding schedule* but
+> runs every transformer layer on all B tokens — it saves **ZERO FLOPs** and is
+> therefore NOT a real FOCUS implementation. The paper's compute win comes from
+> physically evicting tokens after Layer 1 and running L1-attn..L on `|S| ≪ B`.
+> The paper-exact reduced forward is specified in
+> **`notes/focus_paper_exact_plan.md`** — that is the source of truth for the
+> next session. Also note a known bug: `compute_retention_budget` folds N_σ into
+> the budget, but the official kernel does NOT (N_σ is a selection-time
+> expansion). See the plan §1.
+
 ## Implementation Checklist
 
 ### Phase A: Correctness via logit-masking eviction (COMPLETE)

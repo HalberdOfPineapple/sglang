@@ -571,7 +571,9 @@ class LLaDA2MoeAttention(nn.Module):
         attn_output, _ = self.dense(context_layer)
         return attn_output
 
-    def _collect_focus_importance(self, q, k, focus_view):
+    def _collect_focus_importance(
+            self, q: torch.Tensor, k: torch.Tensor, focus_view
+        ):
         """Compute per-token importance from post-RoPE q,k and store on focus_view.
 
         Importance I_j = sum_{i,h} Softmax(MaxPool1D(q_i·k_j/sqrt(d), k=3)) (Eq. 2).
@@ -580,7 +582,9 @@ class LLaDA2MoeAttention(nn.Module):
         """
         from sglang.srt.dllm.algorithm.focus_utils import (
             compute_importance_side_channel,
+            FocusRuntimeView
         )
+        focus_view: FocusRuntimeView = focus_view
 
         # q,k arrive as [num_tokens, q_size]/[num_tokens, kv_size]; reshape to heads.
         num_tokens = q.shape[0]

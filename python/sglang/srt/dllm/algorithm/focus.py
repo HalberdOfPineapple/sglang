@@ -94,6 +94,7 @@ class Focus(DllmAlgorithm):
         # mask[j] True iff position j is still a [MASK] (candidate to decode).
         mask = forward_batch.input_ids == self.mask_id
 
+        # [batch_size, ] retention budget K per request
         budgets = compute_retention_budget(
             delta_I,
             focus_view.avg_decoded,
@@ -102,6 +103,7 @@ class Focus(DllmAlgorithm):
             self.alpha,
             self.block_size,
         )
+        
         _, retained_maps = select_and_enforce_constraints(
             delta_I,
             budgets,
