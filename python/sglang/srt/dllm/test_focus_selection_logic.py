@@ -1,19 +1,20 @@
-"""Logic-level tests for FOCUS selection, including the α→∞ ⇒ retain-all property.
+"""Logic tests for FOCUS selection — budget/threshold/AR-context/placeholder.
 
-These tests validate the host-side decision logic the Focus algorithm relies on,
-without launching a model. The key correctness anchor is: when alpha is large
-enough that the budget K saturates to B (the whole block), FOCUS must retain
-*every* masked position, i.e. it makes the exact same commit decisions as
-LowConfidence (no eviction).
+Pins the official kernel's rules (focus.py:9-30, 142-251):
+  - budget has NO N_σ; α→∞ ⇒ target=mask_len ⇒ should_evict=False ⇒ retain all
+  - selection = top-target by ΔI, OR all candidates (ΔI≥mean+std) if there are
+    at least `target` of them (the N_σ expansion realizing Eq. 4 max(⌈αN̄⌉,N_σ))
+  - AR-Context: retain block-adjacent masked predecessor of a retained successor
+  - Placeholder Integrity: retain masked, not-retained positions left of the
+    rightmost retained masked position (and beyond block_progress)
 """
-
-import math
 
 import torch
 
 from sglang.srt.dllm.algorithm.focus_utils import (
     FocusRuntimeView,
-    compute_retention_budget,
+    compute_focus_targets,
+    compute_should_evict,
     select_and_enforce_constraints,
 )
 
@@ -24,146 +25,181 @@ def _uniform_offsets(batch_size, block_size, device="cpu"):
     )
 
 
-def test_alpha_infinite_retains_all_masked():
-    """α→∞ ⇒ K=B ⇒ every masked position retained (FOCUS == LowConfidence)."""
-    print("Testing α→∞ retains all masked positions...")
+def _mask_lengths(mask, seq_offsets):
+    return torch.tensor(
+        [
+            int(mask[int(seq_offsets[b]):int(seq_offsets[b + 1])].sum().item())
+            for b in range(len(seq_offsets) - 1)
+        ],
+        dtype=torch.int32,
+    )
 
+
+def test_alpha_infinite_no_evict_retains_all():
+    """α→∞ ⇒ target=mask_len ⇒ should_evict False ⇒ retain every masked pos."""
+    print("Testing α→∞ retains all masked...")
     block_size = 8
     batch_size = 3
     seq_offsets = _uniform_offsets(batch_size, block_size)
 
     torch.manual_seed(0)
     delta_I = torch.randn(batch_size * block_size)
-
-    # Arbitrary mask pattern per request.
     mask = torch.zeros(batch_size * block_size, dtype=torch.bool)
-    mask[[1, 2, 3, 5]] = True              # req 0
-    mask[[8 + 0, 8 + 4, 8 + 7]] = True     # req 1
-    mask[[16 + 2, 16 + 3, 16 + 4, 16 + 5, 16 + 6]] = True  # req 2
+    mask[[1, 2, 3, 5]] = True
+    mask[[8 + 0, 8 + 4, 8 + 7]] = True
+    mask[[16 + 2, 16 + 3, 16 + 4, 16 + 5, 16 + 6]] = True
 
-    avg_decoded = torch.tensor([2.0, 1.0, 3.0])
-    huge_alpha = 1e9
+    mask_lengths = _mask_lengths(mask, seq_offsets)
+    avg = torch.tensor([2.0, 1.0, 3.0])
+    targets = compute_focus_targets(mask_lengths, avg, alpha=1e9)
+    assert torch.equal(targets, mask_lengths.to(targets.dtype)), targets.tolist()
+    should_evict = compute_should_evict(mask_lengths, targets)
+    assert not should_evict.any(), should_evict.tolist()
 
-    budgets = compute_retention_budget(
-        delta_I, avg_decoded, mask, seq_offsets, huge_alpha, block_size
+    retain_masks, _ = select_and_enforce_constraints(
+        delta_I, mask, seq_offsets, targets, should_evict, block_size
     )
-    # Budget saturates at block_size.
-    assert torch.all(budgets == block_size), f"budgets={budgets.tolist()}"
-
-    _, retained_maps = select_and_enforce_constraints(
-        delta_I, budgets, mask, seq_offsets, block_size, min_retain=1
-    )
-
     for b in range(batch_size):
-        start = seq_offsets[b].item()
-        end = seq_offsets[b + 1].item()
-        masked_positions = torch.where(mask[start:end])[0]
-        retained = retained_maps[b]
-        # Every masked position must be in the retained set.
-        for pos in masked_positions.tolist():
-            assert pos in retained.tolist(), (
-                f"req {b}: masked pos {pos} not retained "
-                f"(retained={sorted(retained.tolist())})"
-            )
-    print("  ✓ All masked positions retained when K=B")
-    print("α→∞ equivalence: passed! ✓\n")
+        assert torch.all(retain_masks[b]), f"req {b} must retain all at α→∞"
+    print("  ✓ all positions retained (== LowConfidence anchor)")
+    print("α→∞ no-evict: passed! ✓\n")
 
 
 def test_small_alpha_evicts():
-    """Small α with low historical yield ⇒ K < #masked ⇒ some eviction happens."""
-    print("Testing small α evicts non-decodable positions...")
-
+    """Small α with low yield ⇒ target< mask_len ⇒ eviction occurs."""
+    print("Testing small α evicts...")
     block_size = 16
-    batch_size = 1
-    seq_offsets = _uniform_offsets(batch_size, block_size)
-
-    # All 16 positions masked.
+    seq_offsets = _uniform_offsets(1, block_size)
     mask = torch.ones(block_size, dtype=torch.bool)
-
-    # A few positions have clearly higher ΔI (decodable); the rest near-zero.
     delta_I = torch.full((block_size,), -1.0)
-    delta_I[[3, 4]] = 5.0  # strongly decodable
+    delta_I[[3, 4]] = 5.0
 
-    avg_decoded = torch.tensor([1.0])  # low historical yield
-    alpha = 1.5
+    mask_lengths = _mask_lengths(mask, seq_offsets)
+    targets = compute_focus_targets(mask_lengths, torch.tensor([1.0]), alpha=1.5)
+    assert targets.item() == 2, targets.item()  # ceil(1.5*1)=2
+    should_evict = compute_should_evict(mask_lengths, targets)
+    assert should_evict.item()
 
-    budgets = compute_retention_budget(
-        delta_I, avg_decoded, mask, seq_offsets, alpha, block_size
+    retain_masks, retained_maps = select_and_enforce_constraints(
+        delta_I, mask, seq_offsets, targets, should_evict, block_size
     )
-    K = budgets[0].item()
-    # base = ceil(1.5 * 1) = 2; N_sigma counts ΔI ≥ mean+std (the two high ones).
-    assert K < block_size, f"expected eviction (K<{block_size}), got K={K}"
-    print(f"  Budget K={K} < block_size={block_size}")
+    assert int(retain_masks[0].sum().item()) < block_size, "must evict"
+    s = set(retained_maps[0].tolist())
+    assert 3 in s and 4 in s, "high-ΔI positions kept"
+    print(f"  retained {len(s)}/{block_size}, high-ΔI kept")
+    print("small-α eviction: passed! ✓\n")
 
-    _, retained_maps = select_and_enforce_constraints(
-        delta_I, budgets, mask, seq_offsets, block_size, min_retain=1
+
+def test_nsigma_threshold_or_topk():
+    """Pin the threshold-OR-topk rule against explicit cases."""
+    print("Testing N_σ threshold-OR-topk rule...")
+    block_size = 10
+    seq_offsets = _uniform_offsets(1, block_size)
+    # Non-adjacent masked positions so AR-context adds nothing.
+    mask = torch.zeros(block_size, dtype=torch.bool)
+    mask[[0, 2, 4, 6, 8]] = True
+
+    # Case A: expansion FIRES. ΔI on masked (ascending pos) = [9,9,-9,-9,-9].
+    # mean=-1.8, std≈8.8, thr≈7 ⇒ candidates={pos0,pos2}; target=2 ⇒ count≥target
+    # ⇒ selection = candidates. Rightmost retained=2 ⇒ no placeholder add.
+    dA = torch.full((block_size,), 0.0)
+    dA[[0, 2]] = 9.0
+    dA[[4, 6, 8]] = -9.0
+    targets = torch.tensor([2], dtype=torch.int32)
+    should_evict = torch.tensor([True])
+    _, mapsA = select_and_enforce_constraints(
+        dA, mask, seq_offsets, targets, should_evict, block_size
     )
-    retained = retained_maps[0]
-    assert len(retained) < block_size, "should evict at least one position"
-    # The two strongly-decodable positions must survive.
-    assert 3 in retained.tolist() and 4 in retained.tolist()
-    print(f"  Retained {len(retained)}/{block_size}; high-ΔI positions kept")
-    print("Small-α eviction: passed! ✓\n")
+    masked_retained_A = sorted(p for p in mapsA[0].tolist() if mask[p])
+    assert masked_retained_A == [0, 2], masked_retained_A
+    print(f"  ✓ expansion fires: masked retained={masked_retained_A}")
+
+    # Case B: expansion does NOT fire ⇒ top-target. ΔI=[9,8,7,6,5], target=3.
+    # thr≈8.41 ⇒ candidates={pos0} (count1<3) ⇒ top-3 = pos {0,2,4}.
+    dB = torch.full((block_size,), 0.0)
+    dB[0], dB[2], dB[4], dB[6], dB[8] = 9.0, 8.0, 7.0, 6.0, 5.0
+    targetsB = torch.tensor([3], dtype=torch.int32)
+    _, mapsB = select_and_enforce_constraints(
+        dB, mask, seq_offsets, targetsB, should_evict, block_size
+    )
+    masked_retained_B = sorted(p for p in mapsB[0].tolist() if mask[p])
+    assert masked_retained_B == [0, 2, 4], masked_retained_B
+    print(f"  ✓ expansion off → top-k: masked retained={masked_retained_B}")
+    print("N_σ threshold-OR-topk: passed! ✓\n")
 
 
-def test_ar_context_preservation():
-    """Each retained position's predecessor (i-1) must also be retained."""
-    print("Testing AR-Context Preservation...")
-
+def test_ar_context_predecessor():
+    """A retained masked successor pulls in its block-adjacent masked predecessor."""
+    print("Testing AR-Context predecessor...")
     block_size = 8
-    batch_size = 1
-    seq_offsets = _uniform_offsets(batch_size, block_size)
-
-    mask = torch.ones(block_size, dtype=torch.bool)
+    seq_offsets = _uniform_offsets(1, block_size)
+    # Masked at 4,5 (adjacent). Only 5 has high ΔI.
+    mask = torch.zeros(block_size, dtype=torch.bool)
+    mask[[4, 5]] = True
     delta_I = torch.zeros(block_size)
-    delta_I[5] = 10.0  # only position 5 strongly selected
-
-    budgets = torch.tensor([1], dtype=torch.int32)
-    _, retained_maps = select_and_enforce_constraints(
-        delta_I, budgets, mask, seq_offsets, block_size, min_retain=1
+    delta_I[5] = 10.0
+    targets = torch.tensor([1], dtype=torch.int32)
+    should_evict = torch.tensor([True])
+    _, maps = select_and_enforce_constraints(
+        delta_I, mask, seq_offsets, targets, should_evict, block_size
     )
-    retained = set(retained_maps[0].tolist())
-    assert 5 in retained, "top position retained"
-    assert 4 in retained, "predecessor (AR-context) retained"
-    print(f"  Retained: {sorted(retained)} (includes predecessor 4)")
-    print("AR-Context Preservation: passed! ✓\n")
+    s = set(maps[0].tolist())
+    assert 5 in s, "top retained"
+    assert 4 in s, "adjacent masked predecessor retained (AR-context)"
+    print(f"  ✓ retained includes predecessor: {sorted(s & {4,5})}")
+    print("AR-Context: passed! ✓\n")
 
 
 def test_placeholder_integrity():
-    """All masked positions below max(S) are retained (valid reference KV)."""
+    """Masked, not-retained positions left of rightmost retained are kept."""
     print("Testing Placeholder Integrity...")
-
     block_size = 8
-    batch_size = 1
-    seq_offsets = _uniform_offsets(batch_size, block_size)
-
-    # Positions 1,3,5,7 masked; the rest already decoded.
+    seq_offsets = _uniform_offsets(1, block_size)
+    # Masked at 1,3,5,7 (non-adjacent → no AR). Select only the last (pos 7).
     mask = torch.zeros(block_size, dtype=torch.bool)
     mask[[1, 3, 5, 7]] = True
-
     delta_I = torch.zeros(block_size)
-    delta_I[7] = 10.0  # select the last masked position
-
-    budgets = torch.tensor([1], dtype=torch.int32)
-    _, retained_maps = select_and_enforce_constraints(
-        delta_I, budgets, mask, seq_offsets, block_size, min_retain=1
+    delta_I[7] = 10.0
+    targets = torch.tensor([1], dtype=torch.int32)
+    should_evict = torch.tensor([True])
+    _, maps = select_and_enforce_constraints(
+        delta_I, mask, seq_offsets, targets, should_evict, block_size
     )
-    retained = set(retained_maps[0].tolist())
-    # max(S) reaches 7, so all masked positions <7 (1,3,5) must be retained.
-    for pos in [1, 3, 5, 7]:
-        assert pos in retained, f"masked pos {pos} below max(S) must be retained"
-    print(f"  Retained: {sorted(retained)} (all masked ≤ max kept)")
+    s = set(maps[0].tolist())
+    # rightmost retained masked = 7 ⇒ masked {1,3,5} (<7) retained as placeholders.
+    for p in [1, 3, 5, 7]:
+        assert p in s, f"masked {p} ≤ rightmost retained must be kept"
+    print(f"  ✓ placeholders kept: {sorted(p for p in s if mask[p])}")
     print("Placeholder Integrity: passed! ✓\n")
 
 
-def test_focus_runtime_view_delta():
-    """FocusRuntimeView aggregates per-layer importance into ΔI = I1 - I0."""
-    print("Testing FocusRuntimeView ΔI...")
+def test_placeholder_respects_block_progress():
+    """Placeholder only keeps positions beyond block_progress."""
+    print("Testing Placeholder block_progress gate...")
+    block_size = 8
+    seq_offsets = _uniform_offsets(1, block_size)
+    mask = torch.zeros(block_size, dtype=torch.bool)
+    mask[[1, 3, 5, 7]] = True
+    delta_I = torch.zeros(block_size)
+    delta_I[7] = 10.0
+    targets = torch.tensor([1], dtype=torch.int32)
+    should_evict = torch.tensor([True])
+    # progress=3 ⇒ only masked positions >3 (i.e. 5) qualify as placeholders; 1,3 excluded.
+    _, maps = select_and_enforce_constraints(
+        delta_I, mask, seq_offsets, targets, should_evict, block_size,
+        block_progress=torch.tensor([3]),
+    )
+    masked_kept = sorted(p for p in maps[0].tolist() if mask[p])
+    assert masked_kept == [5, 7], masked_kept
+    print(f"  ✓ progress=3 ⇒ masked kept={masked_kept} (1,3 gated out)")
+    print("Placeholder progress gate: passed! ✓\n")
 
+
+def test_focus_runtime_view_delta():
+    """FocusRuntimeView aggregates per-layer importance into ΔI = I1 − I0."""
+    print("Testing FocusRuntimeView ΔI...")
     view = FocusRuntimeView(
-        block_size=4,
-        batch_size=1,
-        seq_offsets=torch.tensor([0, 4]),
+        block_size=4, batch_size=1, seq_offsets=torch.tensor([0, 4]),
         importance_layers=(0, 1),
     )
     assert not view.has_importance()
@@ -171,9 +207,8 @@ def test_focus_runtime_view_delta():
     assert not view.has_importance()
     view.set_layer_importance(1, torch.tensor([2.0, 2.0, 5.0, 1.0]))
     assert view.has_importance()
-    delta = view.get_delta_importance()
-    assert torch.allclose(delta, torch.tensor([1.0, 0.0, 2.0, -3.0]))
-    print("  ✓ ΔI computed correctly from two layers")
+    assert torch.allclose(view.get_delta_importance(), torch.tensor([1.0, 0.0, 2.0, -3.0]))
+    print("  ✓ ΔI correct")
     print("FocusRuntimeView: passed! ✓\n")
 
 
@@ -182,10 +217,12 @@ if __name__ == "__main__":
     print("FOCUS Selection Logic Tests")
     print("=" * 60 + "\n")
     try:
-        test_alpha_infinite_retains_all_masked()
+        test_alpha_infinite_no_evict_retains_all()
         test_small_alpha_evicts()
-        test_ar_context_preservation()
+        test_nsigma_threshold_or_topk()
+        test_ar_context_predecessor()
         test_placeholder_integrity()
+        test_placeholder_respects_block_progress()
         test_focus_runtime_view_delta()
         print("=" * 60)
         print("ALL TESTS PASSED ✓")

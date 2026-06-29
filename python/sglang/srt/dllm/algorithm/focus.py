@@ -29,7 +29,8 @@ import torch.nn.functional as F
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.dllm.algorithm.focus_utils import (
     FocusRuntimeView,
-    compute_retention_budget,
+    compute_focus_targets,
+    compute_should_evict,
     select_and_enforce_constraints,
 )
 from sglang.srt.dllm.config import DllmConfig
@@ -86,31 +87,37 @@ class Focus(DllmAlgorithm):
         """Run FOCUS budgeting + selection. Returns per-request retained block indices.
 
         Importance was collected during the just-finished forward; here we form
-        ΔI, restrict to currently-masked positions, compute the budget K and the
-        structurally-enforced retained set S.
+        ΔI, compute the per-request budget (no N_σ), the should-evict flag, and
+        the structurally-enforced retained set S (top-k OR N_σ expansion,
+        AR-context, placeholder integrity). Mirrors the official kernels.
         """
         delta_I = focus_view.get_delta_importance()  # [batch * block_size]
 
         # mask[j] True iff position j is still a [MASK] (candidate to decode).
         mask = forward_batch.input_ids == self.mask_id
 
-        # [batch_size, ] retention budget K per request
-        budgets = compute_retention_budget(
-            delta_I,
-            focus_view.avg_decoded,
-            mask,
-            focus_view.seq_offsets,
-            self.alpha,
-            self.block_size,
+        # Per-request masked counts via CSR boundaries.
+        seq_offsets = focus_view.seq_offsets
+        batch_size = len(seq_offsets) - 1
+        mask_lengths = torch.tensor(
+            [
+                int(mask[int(seq_offsets[b]):int(seq_offsets[b + 1])].sum().item())
+                for b in range(batch_size)
+            ],
+            dtype=torch.int32,
+            device=delta_I.device,
         )
-        
+
+        targets = compute_focus_targets(mask_lengths, focus_view.avg_decoded, self.alpha)
+        should_evict = compute_should_evict(mask_lengths, targets)
+
         _, retained_maps = select_and_enforce_constraints(
             delta_I,
-            budgets,
             mask,
-            focus_view.seq_offsets,
+            seq_offsets,
+            targets,
+            should_evict,
             self.block_size,
-            self.min_retain,
         )
         return retained_maps
 

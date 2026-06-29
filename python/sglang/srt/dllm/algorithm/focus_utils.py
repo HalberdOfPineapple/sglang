@@ -4,7 +4,6 @@ Phase A: PyTorch reference implementations.
 Phase B: Will be replaced with Triton kernels.
 """
 
-import math
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -117,161 +116,167 @@ def compute_importance_side_channel(
     return torch.cat(importance_list) # [batch_size * block_size] (total_tokens)
 
 
-def compute_retention_budget(
-    delta_I: torch.Tensor,
+def compute_focus_targets(
+    mask_lengths: torch.Tensor,
     avg_decoded: torch.Tensor,
-    mask: torch.Tensor,
-    seq_offsets: torch.Tensor,
     alpha: float,
-    block_length: int,
 ) -> torch.Tensor:
-    """Compute dynamic retention budget K per request (Eq. 4, 5).
+    """Per-request retention budget — mirrors official ``focus_compute_targets``.
+
+    target = where(len<=0, 0, min(len, max(ceil(max(avg,1)*alpha), 1)))
+
+    IMPORTANT: N_σ is NOT part of the budget here (the earlier
+    ``compute_retention_budget`` folded it in, which diverged from the official
+    kernel). The paper's Eq. 4 ``max(⌈αN̄⌉, N_σ)`` is realized at *selection*
+    time: if at least ``target`` masked tokens exceed mean+std, all of them are
+    kept (the N_σ expansion); otherwise the top-``target`` by ΔI are kept. See
+    ``select_and_enforce_constraints`` and focus.py:9-30 / 202-213 in
+    ~/FOCUS_ORIGIN.
 
     Args:
-        delta_I: [total_tokens] importance delta (I1 - I0)
-        avg_decoded: [batch_size] cumulative mean N̄_decoded
-        mask: [total_tokens] boolean mask (True = masked/candidate)
-        seq_offsets: [batch_size + 1] CSR sequence boundaries
-        alpha: Expansion factor (default 1.5)
-        block_length: Block size
+        mask_lengths: [batch_size] number of masked (candidate) tokens per request
+        avg_decoded: [batch_size] cumulative mean N̄_decoded (≥0; clamped to ≥1)
+        alpha: Expansion factor α>1 (default 1.5)
 
     Returns:
-        budgets: [batch_size] retention budget K per request
+        targets: [batch_size] int32 budget per request
     """
-    batch_size = len(seq_offsets) - 1
-    budgets = []
+    avg = torch.clamp(avg_decoded.to(torch.float32), min=1.0)
+    retain = torch.ceil(avg * alpha)
+    retain = torch.clamp(retain, min=1.0)
+    lengths_f = mask_lengths.to(torch.float32)
+    retain = torch.minimum(lengths_f, retain)
+    retain = torch.where(lengths_f <= 0, torch.zeros_like(retain), retain)
+    return retain.to(torch.int32)
 
-    for b in range(batch_size):
-        start = seq_offsets[b].item()
-        end = seq_offsets[b + 1].item()
 
-        if start >= end:
-            budgets.append(1)  # Min retention
-            continue
+def compute_should_evict(
+    mask_lengths: torch.Tensor, targets: torch.Tensor
+) -> torch.Tensor:
+    """should_evict[b] = (target>0) & (mask_len>target) — official model semantics.
 
-        delta_I_b = delta_I[start:end]
-        mask_b = mask[start:end]
-
-        # Only consider masked positions
-        delta_I_masked = delta_I_b[mask_b]
-
-        if len(delta_I_masked) == 0:
-            budgets.append(1)
-            continue
-
-        # Statistical threshold: μ + σ (1σ above mean). With a single masked
-        # token std is undefined; treat that token as above-threshold (N_σ=1).
-        if len(delta_I_masked) == 1:
-            N_sigma = 1
-        else:
-            threshold = delta_I_masked.mean() + delta_I_masked.std()
-            N_sigma = (delta_I_masked >= threshold).sum().item()
-
-        # Base budget from historical average
-        base_budget = math.ceil(alpha * avg_decoded[b].item())
-
-        # Final budget: K = min(B, max(⌈α·N̄⌉, N_σ))
-        K = min(block_length, max(base_budget, N_sigma))
-        budgets.append(K)
-
-    return torch.tensor(budgets, dtype=torch.int32, device=delta_I.device)
+    A request only evicts when its budget is smaller than its masked count;
+    otherwise every masked token is retained (no eviction this step).
+    """
+    return (targets > 0) & (mask_lengths > targets)
 
 
 def select_and_enforce_constraints(
     delta_I: torch.Tensor,
-    budgets: torch.Tensor,
     mask: torch.Tensor,
     seq_offsets: torch.Tensor,
+    targets: torch.Tensor,
+    should_evict: torch.Tensor,
     block_length: int,
-    min_retain: int = 1,
+    block_progress: Optional[torch.Tensor] = None,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    """Select tokens with structural constraints (Algorithm 1).
+    """Faithful port of ``focus_select_and_enforce_ragged`` (focus.py:142-251).
 
-    Constraints:
-    1. TopK selection from masked positions
-    2. AR-Context Preservation: retain predecessor i-1 for each selected i
-    3. Placeholder Integrity: retain all masked j < max(S)
-    4. Minimum retention: |S| >= min_retain
+    Operates on the *processing* set (Phase A: the full block). Among masked
+    candidate positions it decides which to retain; non-masked processing
+    positions are ALWAYS retained (mirrors ``retain_processing_mask`` init-True
+    in the official model code). Steps, per request:
+
+      1. budget select: top-``target`` masked positions by ΔI.
+      2. N_σ expansion: threshold = mean+std over masked ΔI; candidates = ΔI≥thr.
+         If ``candidate_count >= target`` keep ALL candidates, else keep the
+         top-``target`` set from step 1. (This realizes Eq. 4 max(⌈αN̄⌉, N_σ).)
+      3. should_evict=False ⇒ keep ALL masked (no eviction this step).
+      4. AR-Context: a masked position p is retained if its block-adjacent masked
+         successor (p+1, also masked) is retained — i.e. retain the predecessor.
+      5. min-keep: if nothing retained, retain all masked (safety net).
+      6. Placeholder Integrity: retain masked, not-yet-retained positions that lie
+         left of the rightmost retained masked position AND beyond block_progress.
 
     Args:
-        delta_I: [total_tokens] importance delta
-        budgets: [batch_size] retention budget K per request
-        mask: [total_tokens] boolean mask (True = masked/candidate)
-        seq_offsets: [batch_size + 1] CSR sequence boundaries
-        block_length: Block size
-        min_retain: Minimum tokens to retain (default 1)
+        delta_I: [total_tokens] ΔI = I1 − I0 over the processing set.
+        mask: [total_tokens] bool, True = masked candidate.
+        seq_offsets: [batch_size+1] CSR boundaries over the processing set.
+        targets: [batch_size] budget from ``compute_focus_targets``.
+        should_evict: [batch_size] bool from ``compute_should_evict``.
+        block_length: processing-set length per request (Phase A: block size).
+        block_progress: optional [batch_size] rightmost processed position per
+            request (FocusState.rightmost_processed). Defaults to −1 (all
+            positions treated as unprocessed) when None.
 
     Returns:
-        retain_masks: List[Tensor[block_length]] boolean masks per request
-        retained_maps: List[Tensor[variable]] retained indices per request
+        retain_masks: List[BoolTensor[block_length]] processing-set retain mask
+            (non-masked True + selected masked).
+        retained_maps: List[LongTensor] sorted retained block indices.
     """
     batch_size = len(seq_offsets) - 1
-    retain_masks = []
-    retained_maps = []
+    device = delta_I.device
+    retain_masks: List[torch.Tensor] = []
+    retained_maps: List[torch.Tensor] = []
 
     for b in range(batch_size):
-        start = seq_offsets[b].item()
-        end = seq_offsets[b + 1].item()
-        K = budgets[b].item()
+        start = int(seq_offsets[b].item())
+        end = int(seq_offsets[b + 1].item())
+        target = int(targets[b].item())
+        evict = bool(should_evict[b].item())
+        progress = -1 if block_progress is None else int(block_progress[b].item())
 
+        retain_mask = torch.zeros(block_length, dtype=torch.bool, device=device)
         if start >= end:
-            # Empty sequence
-            retain_mask = torch.zeros(block_length, dtype=torch.bool, device=delta_I.device)
-            retained_map = torch.empty(0, dtype=torch.int64, device=delta_I.device)
             retain_masks.append(retain_mask)
-            retained_maps.append(retained_map)
+            retained_maps.append(torch.empty(0, dtype=torch.int64, device=device))
             continue
 
-        delta_I_b = delta_I[start:end]
         mask_b = mask[start:end]
+        dI_b = delta_I[start:end]
+        # Non-masked processing positions are always retained.
+        retain_mask[: (end - start)] = ~mask_b
 
-        # TopK among masked positions
-        masked_indices = torch.where(mask_b)[0]
-
-        if len(masked_indices) == 0:
-            # No masked tokens
-            retain_mask = torch.zeros(block_length, dtype=torch.bool, device=delta_I.device)
-            retained_map = torch.empty(0, dtype=torch.int64, device=delta_I.device)
+        mp = torch.where(mask_b)[0]  # masked block positions (sorted ascending)
+        if mp.numel() == 0:
             retain_masks.append(retain_mask)
-            retained_maps.append(retained_map)
+            retained_maps.append(torch.where(retain_mask)[0])
             continue
 
-        delta_I_masked = delta_I_b[masked_indices]
-        K_actual = min(K, len(masked_indices))
-        topk_in_masked = torch.topk(delta_I_masked, K_actual).indices
-        S = masked_indices[topk_in_masked]
+        dI_m = dI_b[mp]  # ΔI over masked positions, in ascending-position order
+        m = mp.numel()
 
-        # AR-Context Preservation: add i-1 for each i in S
-        if len(S) > 0:
-            predecessors = S - 1
-            predecessors = predecessors[predecessors >= 0]
-            S = torch.unique(torch.cat([S, predecessors]))
+        if not evict:
+            # Keep all masked.
+            sel = torch.ones(m, dtype=torch.bool, device=device)
+        else:
+            k = max(min(target, m), 1)
+            # Step 1: top-k by ΔI.
+            topk_idx = torch.topk(dI_m, k).indices
+            sel = torch.zeros(m, dtype=torch.bool, device=device)
+            sel[topk_idx] = True
+            # Step 2: N_σ expansion (threshold = mean + std over masked ΔI).
+            if m == 1:
+                cand = torch.ones(m, dtype=torch.bool, device=device)
+            else:
+                thr = dI_m.mean() + dI_m.std(unbiased=False)
+                cand = dI_m >= thr
+            if int(cand.sum().item()) >= k:
+                sel = cand.clone()
 
-        # Placeholder Integrity: retain all masked j < max(S)
-        if len(S) > 0:
-            max_S = S.max().item()
-            placeholder_indices = torch.arange(max_S + 1, device=delta_I.device)
-            # Only add if they're masked
-            placeholder_indices = placeholder_indices[mask_b[:max_S + 1]]
-            S = torch.unique(torch.cat([S, placeholder_indices]))
+        # Step 4: AR-Context — retain predecessor of a retained adjacent masked
+        # successor. One vectorized pass (matches the kernel's single update).
+        if m > 1:
+            adjacent = (mp[1:] - mp[:-1]) == 1  # masked p,p+1 are block-adjacent
+            adjust = adjacent & sel[1:] & (~sel[:-1])
+            sel[:-1] = sel[:-1] | adjust
 
-        # Minimum retention
-        if len(S) < min_retain:
-            # Add top importance masked tokens to reach min_retain
-            remaining = min_retain - len(S)
-            candidates = masked_indices[~torch.isin(masked_indices, S)]
-            if len(candidates) > 0:
-                remaining_topk = torch.topk(
-                    delta_I_b[candidates], min(remaining, len(candidates))
-                ).indices
-                S = torch.cat([S, candidates[remaining_topk]])
-                S = torch.unique(S)
+        # Step 5: min-keep safety net.
+        if int(sel.sum().item()) == 0:
+            sel[:] = True
 
-        # Build retain_mask
-        retain_mask = torch.zeros(block_length, dtype=torch.bool, device=delta_I.device)
-        retain_mask[S] = True
+        # Step 6: Placeholder Integrity — retain masked, not-retained positions
+        # left of the rightmost retained masked position and beyond progress.
+        retained_positions = mp[sel]
+        if retained_positions.numel() > 0:
+            rightmost = int(retained_positions.max().item())
+            evicted_before = (mp < rightmost) & (~sel)
+            is_unprocessed = mp > progress
+            need_keep = evicted_before & is_unprocessed
+            sel = sel | need_keep
 
+        retain_mask[mp[sel]] = True
         retain_masks.append(retain_mask)
-        retained_maps.append(S)
+        retained_maps.append(torch.where(retain_mask)[0])
 
     return retain_masks, retained_maps
