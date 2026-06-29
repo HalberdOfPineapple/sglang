@@ -440,6 +440,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
+    # For FOCUS dLLM token eviction: runtime view holding per-layer importance
+    # collection state. Set by the Focus algorithm before a focused forward;
+    # read by attention layers to collect intra-block importance scores.
+    focus_view: Optional[object] = None
+
     @classmethod
     def init_new(
         cls,

@@ -5,10 +5,47 @@ Phase B: Will be replaced with Triton kernels.
 """
 
 import math
-from typing import List, Tuple
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+
+
+@dataclass
+class FocusRuntimeView:
+    """Runtime state threaded through the forward pass for FOCUS.
+
+    Lives on ``forward_batch.focus_view``. The attention layers read
+    ``seq_offsets``/``maxpool_k``/``importance_layers`` to collect per-layer
+    importance via ``set_layer_importance``; the algorithm reads ``importance``
+    back after the forward to compute ΔI and run selection.
+
+    For Phase A the block layout is uniform (every request contributes a full
+    ``block_size`` slice), so ``seq_offsets`` is a simple arange. Once the
+    delayed cache shrinks the processed set this becomes a true ragged CSR.
+    """
+
+    block_size: int
+    batch_size: int
+    seq_offsets: torch.Tensor  # [batch_size + 1] CSR boundaries over processed tokens
+    maxpool_k: int = 3
+    importance_layers: Tuple[int, ...] = (0, 1)
+    # avg_decoded[b] = N̄_decoded for request b (cumulative-mean decode yield)
+    avg_decoded: Optional[torch.Tensor] = None
+    # Filled in by attention layers, keyed by layer_id.
+    importance: dict = field(default_factory=dict)
+
+    def set_layer_importance(self, layer_id: int, value: torch.Tensor):
+        self.importance[layer_id] = value
+
+    def get_delta_importance(self) -> torch.Tensor:
+        """ΔI = I^(Layer1) − I^(Layer0) (Eq. 3), the decodability signal."""
+        l0, l1 = self.importance_layers[0], self.importance_layers[1]
+        return self.importance[l1] - self.importance[l0]
+
+    def has_importance(self) -> bool:
+        return all(layer in self.importance for layer in self.importance_layers)
 
 
 def compute_importance_side_channel(

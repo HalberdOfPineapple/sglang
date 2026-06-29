@@ -513,6 +513,7 @@ class LLaDA2MoeAttention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
+        self.layer_id = layer_id
         self.alt_stream = alt_stream
 
     def forward(
@@ -552,6 +553,14 @@ class LLaDA2MoeAttention(nn.Module):
                 else None
             ),
         )
+
+        # FOCUS importance side-channel: collect intra-block attention scores from
+        # the post-RoPE q,k at the two importance layers (0 and 1). This is a cheap
+        # O(B^2 H d) computation that does not alter the normal attention output.
+        focus_view = getattr(forward_batch, "focus_view", None)
+        if focus_view is not None and self.layer_id in focus_view.importance_layers:
+            self._collect_focus_importance(q, k, focus_view)
+
         context_layer = self.attn(
             q,
             k,
@@ -561,6 +570,35 @@ class LLaDA2MoeAttention(nn.Module):
         )
         attn_output, _ = self.dense(context_layer)
         return attn_output
+
+    def _collect_focus_importance(self, q, k, focus_view):
+        """Compute per-token importance from post-RoPE q,k and store on focus_view.
+
+        Importance I_j = sum_{i,h} Softmax(MaxPool1D(q_i·k_j/sqrt(d), k=3)) (Eq. 2).
+        Heads are summed locally; cross-TP aggregation (sum over sharded heads)
+        happens once on the host after the prefix forward (single small all-reduce).
+        """
+        from sglang.srt.dllm.algorithm.focus_utils import (
+            compute_importance_side_channel,
+        )
+
+        # q,k arrive as [num_tokens, q_size]/[num_tokens, kv_size]; reshape to heads.
+        num_tokens = q.shape[0]
+        q_h = q.view(num_tokens, self.num_heads, self.head_dim)
+        # MQA/GQA: broadcast kv heads to query heads for the score side-channel.
+        k_h = k.view(num_tokens, self.num_kv_heads, self.head_dim)
+        if self.num_kv_heads != self.num_heads:
+            rep = self.num_heads // self.num_kv_heads
+            k_h = k_h.repeat_interleave(rep, dim=1)
+
+        importance = compute_importance_side_channel(
+            q_h,
+            k_h,
+            focus_view.seq_offsets,
+            self.scale,
+            maxpool_k=focus_view.maxpool_k,
+        )
+        focus_view.set_layer_importance(self.layer_id, importance)
 
 
 class LLaDA2MoeBlock(nn.Module):

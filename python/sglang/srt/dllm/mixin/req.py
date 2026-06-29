@@ -80,7 +80,7 @@ class ReqDllmMixin:
         self.dllm_config = dllm_config
 
         # Initialize FOCUS state if using Focus algorithm
-        if self.dllm_config is not None and self.dllm_config.algorithm_name == "Focus":
+        if self.dllm_config is not None and self.dllm_config.algorithm == "Focus":
             self.focus_state = FocusState(block_length=dllm_config.block_size)
             self.delayed_cache_state = DelayedCacheState(
                 block_length=dllm_config.block_size,
