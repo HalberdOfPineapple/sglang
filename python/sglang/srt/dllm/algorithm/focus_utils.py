@@ -57,6 +57,18 @@ def compute_importance_side_channel(
 ) -> torch.Tensor:
     """Compute importance scores from Q/K projections (Eq. 2, 15).
 
+    I_j = sum_{i,h} Softmax_j( MaxPool1D_j( S^h_{i,j} ) ),  S^h_{i,j}=q_i^h·k_j^h/√d
+
+    Axis semantics (verified against the official Triton kernel
+    _focus_importance_ragged_kernel and SnapKV; see test_focus_importance_axes):
+      - i = query index (row), j = key index (column).
+      - MaxPool1D and Softmax run along the KEY axis j, once per query row i
+        (the standard attention direction).
+      - The SUM over queries i (and heads h) is the *column-wise* aggregation
+        depicted in Fig. 5 ("Column-Wise Sums of Delta Matrix").
+      - The output I_j is therefore indexed by KEY position j (how much a token
+        is attended-to by the rest of the block), not by query.
+
     Args:
         q: Query tensor [total_tokens, num_heads, head_dim] (post-RoPE)
         k: Key tensor [total_tokens, num_heads, head_dim] (post-RoPE)
@@ -65,7 +77,7 @@ def compute_importance_side_channel(
         maxpool_k: Maxpool kernel size (default 3)
 
     Returns:
-        importance: [total_tokens] importance scores per token
+        importance: [total_tokens] importance score per token (by key position)
     """
     batch_size = len(seq_offsets) - 1
     importance_list = []
@@ -86,6 +98,8 @@ def compute_importance_side_channel(
         # MaxPool1D along key axis (smoothing)
         H, B, _ = S.shape
         S_flat = S.reshape(H * B, -1).unsqueeze(1)  # [H*B, 1, B]
+
+        # the dimension is padded by maxpool_k // 2 on the two sides so the resulting tensor has the same length as the input tensor
         S_pooled = F.max_pool1d(S_flat, kernel_size=maxpool_k, stride=1, padding=maxpool_k // 2)
         S_pooled = S_pooled.squeeze(1).view(H, B, -1)  # [H, B, B]
 
