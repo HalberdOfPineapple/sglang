@@ -142,6 +142,31 @@ def test_make_focus_phase_batch():
     assert fb1.extend_seq_lens.tolist() == [1, 2]
     assert torch.equal(fb1.out_cache_loc, base.out_cache_loc)  # not overridden
     print("  ✓ Phase S + A1 fields stamped; base untouched")
+
+    # §A3: passing new_lens_cpu (the single per-step D2H) must be bit-identical to
+    # the internal .cpu() fallback for every host + device metadata field.
+    for phase, oc in ((PHASE_S, s_loc), (PHASE_A1, None)):
+        fb_fallback = make_focus_phase_batch(
+            base, phase, block_size, new_lens, compact_ids, compact_pos, oc
+        )
+        fb_passed = make_focus_phase_batch(
+            base,
+            phase,
+            block_size,
+            new_lens,
+            compact_ids,
+            compact_pos,
+            oc,
+            new_lens_cpu=new_lens.detach().cpu(),
+        )
+        assert fb_fallback.seq_lens_cpu.tolist() == fb_passed.seq_lens_cpu.tolist()
+        assert fb_fallback.seq_lens_sum == fb_passed.seq_lens_sum
+        assert fb_fallback.extend_seq_lens_cpu == fb_passed.extend_seq_lens_cpu
+        assert fb_fallback.extend_prefix_lens_cpu == fb_passed.extend_prefix_lens_cpu
+        assert fb_fallback.extend_num_tokens == fb_passed.extend_num_tokens
+        assert torch.equal(fb_fallback.seq_lens, fb_passed.seq_lens)
+        assert torch.equal(fb_fallback.extend_seq_lens, fb_passed.extend_seq_lens)
+    print("  ✓ new_lens_cpu path ≡ .cpu() fallback (A3)")
     print("make_focus_phase_batch: passed! ✓\n")
 
 

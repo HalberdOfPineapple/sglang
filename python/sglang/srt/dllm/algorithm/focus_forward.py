@@ -29,7 +29,7 @@ that stamps the computed fields onto a shallow-copied ForwardBatch.
 """
 
 import copy
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -122,14 +122,14 @@ def build_phase_s_out_cache_loc(
         [sum(|S_b|)] long: retained KV slots, request-major.
     """
     bs = new_lens.numel()
-    parts: List[torch.Tensor] = []
-    for b in range(bs):
-        s = int(new_lens[b].item())
-        base = b * block_size
-        parts.append(out_cache_loc[base : base + s])
-    if not parts:
+    if bs == 0:
         return out_cache_loc.new_empty(0)
-    return torch.cat(parts)
+    # Vectorized (§A2): gather the first |S_b| slots of each block via a
+    # ``arange(B) < |S_b|`` prefix mask over the [bs, B] block grid — no D2H sync.
+    grid = out_cache_loc[: bs * block_size].view(bs, block_size)
+    cols = torch.arange(block_size, device=new_lens.device)
+    prefix_mask = cols.unsqueeze(0) < new_lens.to(torch.int64).unsqueeze(1)
+    return grid[prefix_mask]
 
 
 def make_focus_phase_batch(
@@ -140,6 +140,7 @@ def make_focus_phase_batch(
     compact_input_ids: torch.Tensor,
     compact_positions: torch.Tensor,
     compact_out_cache_loc: Optional[torch.Tensor] = None,
+    new_lens_cpu: Optional[torch.Tensor] = None,
 ):
     """Shallow-copy ``base_fb`` and stamp the per-phase reduced-forward fields.
 
@@ -152,22 +153,42 @@ def make_focus_phase_batch(
     full-block KV from Phase P), so ``out_cache_loc`` is left as the base value
     and the caller must invoke attention with ``save_kv_cache=False``. For Phase
     S, pass ``compact_out_cache_loc`` from ``build_phase_s_out_cache_loc``.
+
+    §A3 (de-sync): the FlashInfer prefill plan reads the host lists
+    ``seq_lens_cpu`` / ``extend_prefix_lens_cpu`` / ``extend_seq_lens_cpu``. All
+    three are deterministic host arithmetic on ``base_fb.seq_lens_cpu`` (already
+    on host), ``block_size`` and ``|S_b|``. The caller passes ``new_lens_cpu``
+    (one ``new_lens.cpu()`` per step shared across both phases) so this builder
+    does ZERO additional D2H — the device fields come from device arithmetic, the
+    host fields from host arithmetic. (When ``new_lens_cpu`` is omitted we fall
+    back to a local ``.cpu()`` so the unit tests and any ad-hoc caller still work.)
     """
+    # Device-side per-phase lens (no sync) for the tensors the GPU path reads.
     phase_seq_lens, extend_prefix_lens, extend_seq_lens = compute_focus_phase_lens(
         phase, base_fb.seq_lens, block_size, new_lens
     )
+    # Host-side per-phase lens (no sync; seq_lens_cpu is already host) for the
+    # FlashInfer plan's *_cpu lists.
+    if new_lens_cpu is None:
+        new_lens_cpu = new_lens.detach().cpu()
+    seq_lens_cpu = base_fb.seq_lens_cpu
+    (
+        phase_seq_lens_cpu,
+        extend_prefix_lens_cpu,
+        extend_seq_lens_cpu,
+    ) = compute_focus_phase_lens(phase, seq_lens_cpu, block_size, new_lens_cpu)
 
     fb = copy.copy(base_fb)
     fb.input_ids = compact_input_ids
     fb.positions = compact_positions
     fb.seq_lens = phase_seq_lens
-    fb.seq_lens_cpu = phase_seq_lens.detach().cpu()
-    fb.seq_lens_sum = int(phase_seq_lens.sum().item())
+    fb.seq_lens_cpu = phase_seq_lens_cpu
+    fb.seq_lens_sum = int(phase_seq_lens_cpu.sum())
     fb.extend_seq_lens = extend_seq_lens.to(torch.int32)
     fb.extend_prefix_lens = extend_prefix_lens.to(torch.int32)
-    fb.extend_seq_lens_cpu = extend_seq_lens.detach().cpu().tolist()
-    fb.extend_prefix_lens_cpu = extend_prefix_lens.detach().cpu().tolist()
-    fb.extend_num_tokens = int(extend_seq_lens.sum().item())
+    fb.extend_seq_lens_cpu = extend_seq_lens_cpu.tolist()
+    fb.extend_prefix_lens_cpu = extend_prefix_lens_cpu.tolist()
+    fb.extend_num_tokens = int(extend_seq_lens_cpu.sum())
     if compact_out_cache_loc is not None:
         fb.out_cache_loc = compact_out_cache_loc
     # The importance side-channel only fires in Phase P; the suffix must not

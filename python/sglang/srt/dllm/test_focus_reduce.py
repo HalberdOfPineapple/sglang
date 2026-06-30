@@ -4,6 +4,7 @@ import torch
 
 from sglang.srt.dllm.algorithm.focus_reduce import (
     build_retained_index,
+    build_retained_index_from_mask,
     cu_seqlens_from_lens,
     focus_compact_states,
 )
@@ -43,6 +44,34 @@ def test_build_retained_index():
     print(f"  ✓ keep_index={keep_index.tolist()}")
     print(f"  ✓ new_lens={new_lens.tolist()}")
     print("build_retained_index: passed! ✓\n")
+
+
+def test_build_retained_index_from_mask_matches_loop():
+    """§A2 on-device builder ≡ the Python-loop oracle (uniform block grid)."""
+    print("Testing build_retained_index_from_mask vs loop oracle...")
+    block = 8
+    seq_offsets = torch.tensor([0, 8, 16, 24], dtype=torch.int64)
+    retained_maps = [
+        torch.tensor([0, 1, 3, 7]),
+        torch.tensor([2, 4]),
+        torch.tensor([0, 1, 2, 3, 4, 5]),
+    ]
+    # Build the equivalent [bs, block] dense retain mask the algorithm stacks.
+    retain_mask_2d = torch.zeros(3, block, dtype=torch.bool)
+    for b, rm in enumerate(retained_maps):
+        retain_mask_2d[b, rm] = True
+
+    keep_ref, lens_ref = build_retained_index(retained_maps, seq_offsets)
+    keep_new, lens_new = build_retained_index_from_mask(retain_mask_2d)
+    assert torch.equal(keep_new, keep_ref), (keep_new.tolist(), keep_ref.tolist())
+    assert torch.equal(lens_new, lens_ref), (lens_new.tolist(), lens_ref.tolist())
+    # An all-empty request (no retained) → zero-length, indices still request-major.
+    rm2 = torch.zeros(2, block, dtype=torch.bool)
+    rm2[0, torch.tensor([1, 5])] = True
+    k2, l2 = build_retained_index_from_mask(rm2)
+    assert k2.tolist() == [1, 5] and l2.tolist() == [2, 0], (k2.tolist(), l2.tolist())
+    print(f"  ✓ keep_index={keep_new.tolist()} new_lens={lens_new.tolist()}")
+    print("build_retained_index_from_mask: passed! ✓\n")
 
 
 def test_focus_compact_states_matches_oracle():
@@ -114,6 +143,7 @@ if __name__ == "__main__":
     print("=" * 60 + "\n")
     try:
         test_build_retained_index()
+        test_build_retained_index_from_mask_matches_loop()
         test_focus_compact_states_matches_oracle()
         test_cu_seqlens_from_lens()
         test_alpha_inf_identity()

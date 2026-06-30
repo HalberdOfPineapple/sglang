@@ -1,0 +1,51 @@
+# FOCUS Plan A — Graph- and Custom-Kernel-Accelerated Reduced Forward
+
+**Goal:** turn FOCUS's *real* FLOPs reduction (F1: per-step Σ|S|/(B·bs) = 0.66→0.80, i.e. 20–34% fewer L1-attn..L tokens) into a *wall-clock* win. F1 (`experiments/profiling/dllm/focus_vs_lowconf/`) showed the eager prototype is **0.69–0.90× LowConfidence** and the gap *widens* with batch, because per denoising step the split forward pays host overhead that eager cannot hide: (1) a full-block prefix, (2) **3× `attn_backend.init_forward_metadata`** (FlashInfer wrapper plan + `create_flashinfer_kv_indices_triton`), (3) Python per-request selection/commit with many `.item()`/`.cpu()` D2H syncs, (4) `make_focus_phase_batch` `.cpu()`/`.tolist()`. The fix is three layers — **de-sync → kernels → CUDA graph** — each independently measurable on the F1 harness. Anchor at every step: α→∞ ⇒ |S|=B ⇒ generations identical to LowConfidence.
+
+## Where the time goes (F1 diagnosis → levers)
+| Cost per denoising step (FOCUS) | LowConfidence | Lever |
+|---|---|---|
+| 1 full-block prefix (L0 + L1-QKV on B·bs) | — | unavoidable (importance needs all q,k); graph-capture it (§C4) |
+| 3× `init_forward_metadata` (P, A1, S) | 1× | §A (collapse to 1 D2H) + §C (capture/replay buffers) |
+| `compute_importance_side_channel` Python einsum [H,B,B]+maxpool+softmax+sum, ×2 layers | — | §B1 fused Triton |
+| `select_and_enforce_constraints` Python per-request loop (topk/std/`.item()`) | — | §B2 fused Triton |
+| `build_retained_index` Python `.item()` loop; `index_select` ×4 | — | §A2 + §B3 fused compact |
+| `_commit_step` Python per-request loop (`.item()` ×N) | 1 vectorized commit | §A4 vectorize |
+| `make_focus_phase_batch` `.cpu()`/`.tolist()` ×2 | — | §A3 single D2H |
+
+## §A — De-sync the host path (no kernels; do FIRST, cheapest, ~immediate)
+Reduce ~O(bs) D2H syncs/step to **O(1)**. Keep everything on-device; one `new_lens` D2H drives all host-side metadata lists.
+- **A1 `_select_retained` batched:** replace the Python per-request `mask_lengths` loop (`.item()` each) with a single segment-sum over `seq_offsets` (`torch.segment_reduce` / `index_add`). Feed `compute_focus_targets`/`compute_should_evict` (already vectorized) directly; no `.item()`.
+- **A2 `build_retained_index` on-device:** today a Python loop builds `keep_index` with `.item()`. Replace with: per-request retain mask `[bs, B]` (bool) → `keep_index = (mask.flatten().nonzero())` over the request-major flat layout; `new_lens = mask.sum(dim=1)`. Pure tensor ops, zero sync. (`focus_reduce.build_retained_index` keeps the loop version as the test oracle.)
+- **A3 `make_focus_phase_batch` single D2H:** the FlashInfer prefill path reads `seq_lens_cpu`, `extend_prefix_lens_cpu`, `extend_seq_lens_cpu` (host lists). Base `seq_lens_cpu` and the per-request context lengths are already known on host; the only dynamic piece is `new_lens` (= |S_b|). Do **one** `new_lens.cpu()` per step, then build all three `_cpu` lists on host arithmetic (Phase-A1/S lens are deterministic functions of `seq_lens_cpu`, `block_size`, `new_lens` — `compute_focus_phase_lens`). Removes the two `.cpu()`/`.tolist()` round-trips in the applier.
+- **A4 `_commit_step` vectorized (ragged):** replace the per-request loop with one ragged pass over the |S|-flat logits — argmax+softmax → per-token confidence; build a `[B·bs]`-flat confidence (−inf for non-retained/non-masked) via scatter on `keep_index`; per-request "commit > threshold OR top-1" via segment-max keyed on `seq_offsets`; one masked scatter into `forward_batch.input_ids`. No `.item()` (progress-guarantee top-1 done with `segment_argmax`).
+- **A5 single metadata build for A1+S:** A1 and S differ only in `seq_lens`/`out_cache_loc` (kv=context+B vs context+|S|; §8 of `focus_paper_exact_plan.md`). Build both `kv_indices` once from the same `req_to_token` slice base; avoid re-running the indices Triton kernel twice where the prefix (context) portion is shared. (Partial win; full win is §C.)
+  - **❌ DROPPED (2026-06-30, F3-lite, `SGLANG_FOCUS_PHASE_TIMING`):** measured at conc-8 the **3× `init_forward_metadata` rebuild is only ~5% of wall** (`p+a1+s_meta`), not the dominant cost this table assumed. §A5 would need fragile surgery in the *shared* `flashinfer_backend.py` (used by all serving) for a best-case ~3% saving. Skipped. The measured split is `s_fwd ~62%` (Phase S, §C) · `select ~14%` (§B2) · `p_fwd ~12%` (§C4) · `a1_fwd ~4%` · `meta ~5%`.
+- **Gate:** re-run F1; expect the host gap to shrink most at high conc (where the per-request loops dominated). Target: ≥ parity at conc 1, closing at conc 8/16.
+
+## §B — Custom Triton kernels (port `~/FOCUS_ORIGIN/lmdeploy/pytorch/kernels/cuda/focus.py`)
+New module `python/sglang/srt/dllm/kernels/focus.py` (Triton; follow the `add-jit-kernel` skill). Keep the existing PyTorch helpers (`focus_utils.compute_importance_side_channel`, `select_and_enforce_constraints`, `focus_reduce.focus_compact_states`) as **numerical oracles** for unit tests (they already exist + are pinned).
+- **B1 `focus_importance_ragged`:** fuse Q·K + MaxPool1d(k=3) + softmax(keys) + column-sum → I_j, ragged over requests, one pass, over masked positions only. Replaces the Python einsum that materializes `[H,B,B]` per importance-layer per step (the single most expensive host/GPU op today). Called from `LLaDA2MoeAttention.forward_qkv_rope` at layers 0/1 in place of `_collect_focus_importance`. Axis semantics already verified (`test_focus_importance_axes.py`).
+- **B2 `focus_select_and_enforce_ragged`:** fuse ΔI=I1−I0, mean+std threshold OR top-`target`, AR-context adjacency, placeholder integrity, min-keep → retain mask `[bs, B]`, fully on-device. Replaces the Python loop. Unit-test vs `select_and_enforce_constraints` (exact match on the existing cases incl. the N_σ threshold-OR-topk pin).
+- **B3 `focus_compact_states`:** fuse the gather of `q1`/`residual`/`positions`/`input_ids` to |S| with exclusive-prefix-sum keep offsets (one kernel vs 4 `index_select` + the Python keep-index build). Test vs `focus_reduce.focus_compact_states` (`index_select` oracle).
+- **B4 `focus_compute_targets`:** trivial elementwise; keep vectorized torch (no kernel needed).
+- **Promotion path:** B1/B2 are the hot ones; if Triton autotune is insufficient, promote to `sgl-kernel` AOT (the `add-sgl-kernel` skill). Defer.
+- **Gate:** re-run F1; importance + selection now ~free. Expect FOCUS ≥ ~1× at conc≥8 once §A+§B land (host nearly gone; only launch latency remains).
+
+## §C — CUDA-graph capture (the big lever; mirror `~/FOCUS_ORIGIN/.../backends/cuda/graph_runner.py`)
+dLLM currently runs eager (`--disable-cuda-graph`) so per-layer kernel launch latency is fully exposed across L2..L. Capture the suffix so launch + metadata-replay cost vanishes.
+- **C1 Phase-S capture first (biggest, simplest):** capture L2..L (the bulk of the model) as a CUDA graph keyed on **rounded |S|** (power-of-2 < 256, stride-256 ≥ 256, per the official). Pad |S| up to the bucket; padded queries compute but their logits are discarded (or masked). Keep Phase P (prefix) and Phase A1 (L1 attn) eager initially.
+- **C2 metadata capture/replay:** extend the FlashInfer `is_dllm_extend()` branches in `init_forward_metadata_capture_cuda_graph` / `init_forward_metadata_replay_cuda_graph` (flashinfer_backend.py:682,761) to the Phase-S regime: fixed-size `kv_indices`/`kv_indptr`/`qo_indptr` buffers sized to the bucket; on replay write the actual `seq_lens=context+|S|`, `prefix_lens=context`, and `out_cache_loc=block-prefix`. The dLLM page table is token-granular from `req_to_token` (R1, resolved) so the replay just rewrites the contiguous-slice lengths.
+- **C3 graph break at selection:** the host selection between prefix and suffix is a mandatory CPU control break (data-dependent |S|). §A makes it ~1 D2H; overlap it on a side stream (async `new_lens.cpu()` + host arithmetic while the GPU finishes the prefix). The official accepts this exact break (eager prefix, captured suffix).
+- **C4 Phase-P capture (second):** the prefix is the same shape as a normal dLLM full-block extend (q=B·bs) → capture on the **existing dLLM bs-buckets** (the FlashInfer dLLM-extend graph path already exists). Then both ends are graphed; only the tiny selection break is eager.
+- **C5 Phase A1:** smallest; fold into the Phase-S graph as a second metadata regime (kv=context+B), or keep eager (one extra launch). Decide by measurement.
+- **Risk:** padding to the |S| bucket wastes compute (pads back toward B at high redundancy) — net win only when `bucket(|S|) ≪ B`; measure the bucket-waste vs launch-saving tradeoff and tune the bucket ladder. CUDA-graph + MoE-EP all-to-all needs fixed token counts → ties into Plan-B (parallelism) §D bucketization (shared mechanism).
+- **Gate:** re-run F1 with graph on; target FOCUS ≥ LowConfidence at conc≥8, approaching the redundancy-implied ceiling. Add F3 (nsys `nvtx_gpu_proj_sum` on `focus_prefix`/`focus_l1_attn`/`focus_suffix`) to confirm device time drops ∝ redundancy and the host gap is gone.
+
+## §D — Validation & ordering
+- **Correctness (every stage):** α→∞ ≡ LowConfidence on `experiments/dllm/focus_a100_smoke`; each kernel unit-tested vs its PyTorch oracle; graph-on generations == graph-off (greedy, bitwise where reductions allow).
+- **Perf (every stage):** re-run F1 `focus_vs_lowconf` (conc 1/8/16); track speedup vs the 0.90/0.84/0.69 baseline. Add F3 per-phase GPU-projected time once graphs land.
+- **Order:** §A (de-sync, days, immediate partial win) → §B (kernels, removes importance/selection cost) → §C1–C3 (Phase-S graph, the lever) → §C4–C5 (prefix/A1 graph) → re-measure. §A alone should flip conc=1; §A+§B target conc≥8 parity; §C targets a real speedup ∝ (1 − redundancy) where compute-bound.
+- **Regime caveat (from F1):** on LLaDA2.0-mini the per-token GPU work is tiny, so even a perfect host path caps the win near the redundancy ceiling (~1.25–1.5× at these ratios). The decisive perf test is a larger model / longer context (F4) where L2..L dominate — run §C there too.
+
+Cross-refs: `notes/focus_paper_exact_plan.md` (§8 split mechanism), `notes/focus_implementation_progress.md`, F1 report `experiments/profiling/dllm/focus_vs_lowconf/README.md`, parallelism counterpart `notes/focus_parallelism_plan.md` (shares the |S|-bucketization with §C).

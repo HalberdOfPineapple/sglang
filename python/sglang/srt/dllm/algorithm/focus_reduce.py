@@ -47,6 +47,32 @@ def build_retained_index(
     return keep_index, torch.tensor(new_lens, dtype=torch.int32, device=device)
 
 
+def build_retained_index_from_mask(
+    retain_mask_2d: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """On-device (§A2) equivalent of ``build_retained_index`` — zero D2H sync.
+
+    The processing set is uniform ``block_size`` per request (Phase A; DC+ not yet
+    behaviorally active), so the per-request retain masks stack into a dense
+    ``[bs, block_size]`` bool grid. The request-major flat ``nonzero`` then gives
+    exactly the same ``keep_index`` the Python-loop oracle builds (row b's flat
+    index ``b*block_size + pos`` equals ``seq_offsets[b] + pos``), and the row sum
+    gives ``new_lens`` — both without a single ``.item()``.
+
+    Args:
+        retain_mask_2d: [bs, block_size] bool, True = retained block position
+            (non-masked processing positions + selected masked positions).
+
+    Returns:
+        keep_index: [total_retained] long gather index into the flat batch,
+            request-major and ascending within each request.
+        new_lens: [bs] int32 retained token count per request.
+    """
+    keep_index = retain_mask_2d.reshape(-1).nonzero(as_tuple=True)[0]
+    new_lens = retain_mask_2d.sum(dim=1).to(torch.int32)
+    return keep_index, new_lens
+
+
 def focus_compact_states(
     keep_index: torch.Tensor,
     tensors: Dict[str, Optional[torch.Tensor]],

@@ -99,3 +99,14 @@ FOCUS processes 66–80% of block tokens through L1-attn..L (Fig 2 histogram, po
 - **F3 — per-phase GPU time:** nsys `--cuda-graph-trace=node` (graph on) or NVTX `nvtx_gpu_proj_sum` on `focus_prefix`/`focus_l1_attn`/`focus_suffix` vs LowConfidence's `dllm_forward` to attribute the wall-time gap to host vs device and confirm the L2..L device-time actually drops ∝ redundancy.
 - **F4 — larger model / longer context:** repeat on LLaDA2.0-flash (or SDAR) at `max_new_tokens≥512` to find the compute-bound crossover where the 20–34% token cut pays for itself.
 Cross-links: implementation `notes/focus_implementation_progress.md`; plan `notes/focus_paper_exact_plan.md`; correctness anchor `experiments/dllm/focus_a100_smoke/`; profiling family `experiments/profiling/dllm/README.md`.
+
+## Update — 2026-06-30 (Plan-A §A host-path de-sync, Direction 2 partial)
+Re-ran the **identical** sweep after landing `focus_graph_kernel_plan.md` §A (de-sync the per-step host path, no kernels: batched `_select_retained`, on-device `build_retained_index`/`out_cache_loc`, single-D2H `make_focus_phase_batch`, fully vectorized `_commit_step`; reducing O(bs) D2H syncs/step → O(1)). Generations bit-identical to the pre-§A code (verified by stash A/B on `focus_a100_smoke`: NEW `focus_alpha_inf` == OLD 4/4).
+
+| conc | LowConf tok/s | FOCUS tok/s (§A) | speedup §A | speedup baseline | FOCUS abs (base→§A) | FO redund |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 66 | 60 | 0.91× | 0.90× | 61→60 (flat) | 0.662 |
+| 8 | 289 | 233 | 0.80× | 0.84× | 231→233 (flat) | 0.801 |
+| 16 | 377 | 290 | **0.77×** | 0.69× | 267→**290 (+9%)** | 0.802 |
+
+**Honest read.** §A lifts FOCUS absolute throughput **~9% at conc 16** (where the removed O(bs) per-request loops had the most iterations) and is **flat at conc 1/8** (LowConf moved ±5% run-to-run, so the *ratio* deltas are within noise). Redundancy is unchanged (identical eviction), confirming §A is purely a host-efficiency change. §A does **not** flip FOCUS ≥ LowConfidence here, and — contra the plan's guess — does **not** flip conc 1: at bs=1 those loops were already O(1), so conc 1 is bound by the **3× `init_forward_metadata` rebuild + eager launch latency**, not by O(bs) syncs. The still-present **Python selection loop** (`select_and_enforce_constraints`, the §B2 Triton target) plus the metadata rebuild and eager launches remain the dominant host cost. §A is necessary groundwork for a CUDA graph (which needs a sync-light host path) but insufficient alone — the decisive win still needs **§B2 (selection kernel) + §C (Phase-S graph)** and ideally a compute-bound regime (F4). Data mirror overwritten in place; this row supersedes the baseline table above for the §A code state.

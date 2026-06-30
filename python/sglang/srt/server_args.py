@@ -2942,7 +2942,7 @@ class ServerArgs:
             if not is_musa():
                 self.page_size = 1
             else:
-                self.page_size = 64
+                self.page_size = 64 # Unit of page size: token
 
     def _handle_amd_specifics(self):
         if is_hip():
