@@ -1,0 +1,3 @@
+# LowConfidence baseline (threshold matched to FOCUS for a fair comparison).
+block_size: 32
+threshold: 0.9

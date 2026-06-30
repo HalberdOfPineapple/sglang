@@ -571,6 +571,78 @@ class LLaDA2MoeAttention(nn.Module):
         attn_output, _ = self.dense(context_layer)
         return attn_output
 
+    # ----- FOCUS split-forward seams (paper-exact reduced forward) -------------
+    # The split forward needs to (a) compute Q/K/V + RoPE on the full block and
+    # collect importance WITHOUT running attention yet (prefix), and (b) run
+    # attention on a reduced query set against the cached KV (suffix). The normal
+    # ``forward`` above fuses all three; these seams expose the halves. They are
+    # only used on the FOCUS path; ``forward`` is left untouched for normal serving.
+
+    def forward_qkv_rope(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """QKV proj + QK-norm + RoPE on the FULL block; collect importance.
+
+        No KV write and no attention — returns post-RoPE (q, k, v). The FOCUS
+        importance side-channel fires here (layers 0/1) on the uncompacted q,k,
+        exactly as in the monolithic ``forward``.
+        """
+        qkv, _ = self.query_key_value(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.use_qk_norm:
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=self.query_layernorm,
+                k_norm=self.key_layernorm,
+                head_dim=self.head_dim,
+                alt_stream=self.alt_stream,
+            )
+        q, k = self.rotary_emb(positions, q, k)
+        focus_view = getattr(forward_batch, "focus_view", None)
+        if focus_view is not None and self.layer_id in focus_view.importance_layers:
+            self._collect_focus_importance(q, k, focus_view)
+        return q, k, v
+
+    def write_kv(self, forward_batch: ForwardBatch, k: torch.Tensor, v: torch.Tensor):
+        """Write full-block K,V to this layer's cache at ``out_cache_loc`` (no attn).
+
+        Mirrors the ``set_kv_buffer`` call inside the FlashInfer extend path; used
+        in the FOCUS prefix to persist the full-block L1 KV BEFORE eviction so the
+        retained queries can attend the whole block in Phase A1.
+        """
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        forward_batch.token_to_kv_pool.set_kv_buffer(
+            self.attn,
+            forward_batch.out_cache_loc,
+            k,
+            v,
+            self.attn.k_scale,
+            self.attn.v_scale,
+        )
+
+    def forward_attn(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ) -> torch.Tensor:
+        """Attention core + output projection on the (possibly reduced) q set.
+
+        With ``k=v=None`` and a paged backend, attention reads K/V entirely from
+        the cache via the per-phase ``kv_indices`` (Phase A1: full block; Phase S
+        layers feed fresh k,v and write to the block prefix).
+        """
+        context_layer = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
+        attn_output, _ = self.dense(context_layer)
+        return attn_output
+
     def _collect_focus_importance(
             self, q: torch.Tensor, k: torch.Tensor, focus_view
         ):
@@ -721,6 +793,62 @@ class LLaDA2MoeBlock(nn.Module):
 
         return hidden_states, residual
 
+    # ----- FOCUS split: layer-1 is bisected around the eviction point ----------
+    def forward_focus_prefix_attn(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """L1 prefix: input_ln + QKV+RoPE (collect I1) + full-block KV fill.
+
+        Returns ``(q_full, residual_full)`` over the whole block — the caller
+        compacts both to |S| after the host-side selection, then resumes with
+        ``forward_focus_suffix`` on the reduced set.
+        """
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=forward_batch,
+        )
+        q, k, v = self.attention.forward_qkv_rope(
+            positions, hidden_states, forward_batch
+        )
+        self.attention.write_kv(forward_batch, k, v)
+        return q, residual
+
+    def forward_focus_suffix(
+        self,
+        q: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """L1 suffix: attention on |S| queries vs full-block KV (read-only) + MLP.
+
+        ``q`` / ``residual`` are already compacted to |S|; ``forward_batch`` is the
+        Phase-A1 view (kv = context + full block). Mirrors the back half of
+        ``forward``.
+        """
+        attn_out = self.attention.forward_attn(
+            q, None, None, forward_batch, save_kv_cache=False
+        )
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states=attn_out,
+            residual=residual,
+            forward_batch=forward_batch,
+        )
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+        hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=forward_batch,
+        )
+        return hidden_states, residual
+
 
 class LLaDA2MoeModel(nn.Module):
 
@@ -810,6 +938,64 @@ class LLaDA2MoeModel(nn.Module):
                     hidden_states, _ = self.norm(hidden_states, residual)
             return hidden_states
 
+    # ----- FOCUS split forward (eager, single-GPU; assumes 2 importance layers) -
+    def forward_focus_prefix(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Embed → Layer 0 full (collect I0, write L0 KV) → Layer 1 QKV+RoPE+fill.
+
+        Returns ``(q1_full, residual_full)`` over the whole block; importance I0/I1
+        is left on ``forward_batch.focus_view``. Attention metadata must already be
+        the full-block dLLM-extend metadata (q=B, kv=context+B).
+        """
+        assert self.pp_group.is_first_rank and self.pp_group.is_last_rank, (
+            "FOCUS split forward is single-pipeline-stage only"
+        )
+        hidden_states = self.word_embeddings(input_ids)
+        residual = None
+        # Layer 0: ordinary full-block forward; its attention collects I0 and
+        # writes the L0 KV for the whole block.
+        hidden_states, residual = self.layers[0](
+            positions, hidden_states, forward_batch, residual
+        )
+        # Layer 1 prefix: QKV+RoPE collects I1 and fills the full-block L1 KV; no
+        # attention yet (that runs on the reduced set in the suffix).
+        q1, residual = self.layers[1].forward_focus_prefix_attn(
+            positions, hidden_states, forward_batch, residual
+        )
+        return q1, residual
+
+    def forward_focus_l1_suffix(
+        self,
+        q1: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Layer 1 attention (|S| q vs full-block KV) + Layer 1 MLP. Returns hidden, residual."""
+        return self.layers[1].forward_focus_suffix(q1, forward_batch, residual)
+
+    def forward_focus_rest(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        """Layers 2..L on the reduced set + final norm. Returns hidden states (|S|)."""
+        for i in range(2, self.end_layer):
+            with get_global_expert_distribution_recorder().with_current_layer(i):
+                hidden_states, residual = self.layers[i](
+                    positions, hidden_states, forward_batch, residual
+                )
+        if residual is None:
+            hidden_states = self.norm(hidden_states)
+        else:
+            hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
+
 
 class LLaDA2MoeModelLM(nn.Module):
     def __init__(
@@ -887,6 +1073,24 @@ class LLaDA2MoeModelLM(nn.Module):
             )
         else:
             return hidden_states
+
+    # ----- FOCUS split-forward delegation (see LLaDA2MoeModel) ------------------
+    def forward_focus_prefix(self, input_ids, positions, forward_batch):
+        return self.model.forward_focus_prefix(input_ids, positions, forward_batch)
+
+    def forward_focus_l1_suffix(self, q1, forward_batch, residual):
+        return self.model.forward_focus_l1_suffix(q1, forward_batch, residual)
+
+    def forward_focus_rest_and_logits(
+        self, hidden_states, input_ids, positions, forward_batch, residual
+    ):
+        """Layers 2..L + norm + lm_head over the reduced set. Returns LogitsProcessorOutput."""
+        hidden_states = self.model.forward_focus_rest(
+            hidden_states, positions, forward_batch, residual
+        )
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

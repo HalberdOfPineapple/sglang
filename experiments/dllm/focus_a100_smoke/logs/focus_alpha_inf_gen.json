@@ -7,7 +7,7 @@
   {
     "idx": 1,
     "prompt": "Write a one-sentence definition of a diffusion language model.",
-    "text": "\n\nA diffusion language model is a type of artificial intelligence model that generates text by iteratively denoising random data conditioned on learned language patterns."
+    "text": "\n\nA diffusion language model is a type of artificial intelligence model that generates text by iteratively denoising random data conditioned on learned patterns."
   },
   {
     "idx": 2,

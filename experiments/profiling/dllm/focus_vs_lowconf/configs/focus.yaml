@@ -1,0 +1,9 @@
+# FOCUS reduced-forward config (single A100, LLaDA2.0-mini).
+block_size: 32
+threshold: 0.9          # confidence threshold for committing a masked position
+alpha: 1.5              # expansion factor for dynamic budget K
+maxpool_k: 3            # smoothing kernel for the importance side-channel
+min_retain: 1           # never evict the whole block
+importance_layers: [0, 1]
+enable_delayed_cache: true
+n_bar_init: 1.0         # N̄_decoded default on the first step of a block

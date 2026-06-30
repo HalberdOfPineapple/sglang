@@ -4,20 +4,14 @@ Branch: `feature/focus-implementation`
 Start Date: 2026-06-29
 Target: Phase A correctness (eager, with DC+, single GPU)
 
-> ⚠️ **CRITICAL (2026-06-29, post-review):** the "Phase A" below is a
-> **logit-masking** realization that reproduces FOCUS's *decoding schedule* but
-> runs every transformer layer on all B tokens — it saves **ZERO FLOPs** and is
-> therefore NOT a real FOCUS implementation. The paper's compute win comes from
-> physically evicting tokens after Layer 1 and running L1-attn..L on `|S| ≪ B`.
-> The paper-exact reduced forward is specified in
-> **`notes/focus_paper_exact_plan.md`** — that is the source of truth.
->
-> **UPDATE (2026-06-30):** the host-side math is now paper-correct and tested
-> (the N_σ-in-budget bug is FIXED; selection/compaction match the official
-> kernels and are unit-pinned — plan §0.1). The only remaining gap to real FLOPs
-> savings is the split forward, now specified via per-phase `seq_lens` +
-> contiguous-prefix KV compaction (plan §8, R1 resolved) — paper-exact with **no**
-> custom Triton kernel and no page_size change.
+> ✅ **RESOLVED (2026-06-30, session 2):** the paper-exact reduced (token-evicting)
+> forward is now IMPLEMENTED and validated end-to-end on a single A100 with
+> LLaDA2.0-mini. `Focus.run` no longer does logit-masking — each denoising step
+> runs the 3-phase split (P: L0 full + L1 QKV+fill; A1: L1 attn on |S| vs full-block
+> KV; S: L2..L on |S|), so L1-attn..L execute on `|S| ≪ B` tokens. Measured
+> `Σ|S|/(B·bs)` ramps 0.31→1.0 across a block (real FLOPs savings, matches the
+> paper's redundancy curve). α→∞ anchor matches LowConfidence; α=1.5 stays coherent.
+> Earlier sections (logit-masking "Phase A") are kept for history but are SUPERSEDED.
 
 ## Implementation Checklist
 
@@ -140,6 +134,72 @@ tracking cumulative stats locally within a single `run()` call (correct for
 budgeting within a block-batch; cross-call persistence is a Phase C item).
 
 See `notes/focus_implementation_summary.md` for the full roadmap.
+
+### 2026-06-30 (session 2c): F1 throughput experiment — correct but host-bound (eager)
+- New experiment `experiments/profiling/dllm/focus_vs_lowconf/` (run/parse/plot + README report;
+  data mirror `/cephfs/shared/wxli/sglang-dllm/profiling/dllm/focus_vs_lowconf/`). FOCUS vs
+  LowConfidence on LLaDA2.0-mini, 1×A100, TP=1, eager, HumanEval at conc {1,8,16}.
+- **Result (honest negative): FOCUS is 0.90/0.84/0.69× LowConfidence throughput** (61/231/267 vs
+  68/275/388 tok/s), gap widening with batch — despite genuinely evicting tokens (per-step
+  Σ|S|/(B·bs) mean 0.662/0.784/0.803, i.e. 20–34% fewer tokens in L1-attn..L). Cause = eager
+  per-step host overhead (3× FlashInfer `init_forward_metadata` rebuild + Python per-request
+  selection/commit `.item()`/`.cpu()` syncs) >> the small per-token GPU FLOPs saved on a tiny MoE.
+  The FLOPs cut is real; the wall-clock win needs CUDA-graph capture of Phase S + host-sync
+  removal + a compute-bound regime (bigger model / longer ctx). Redundancy is the number to carry.
+- Added robust redundancy logging: `SGLANG_FOCUS_REDUNDANCY_CSV=<path>` (flushed per step) +
+  `SGLANG_FOCUS_LOG_REDUNDANCY=1` (print). Both no-ops when unset.
+
+### 2026-06-30 (session 2b): Paper-exact reduced forward LANDED + validated on hardware
+- **Model split** (`models/llada2.py`): `LLaDA2MoeAttention.forward_qkv_rope` (QKV+QK-norm+RoPE
+  on the full block, collects importance, no attn/write), `.write_kv` (full-block KV fill via
+  `set_kv_buffer`), `.forward_attn` (attn core + dense on a possibly-reduced q, `k=v=None`
+  reads from cache); `LLaDA2MoeBlock.forward_focus_prefix_attn` (L1: prepare_attn + qkv_rope +
+  fill) / `.forward_focus_suffix` (L1 attn on |S| + MLP); `LLaDA2MoeModel.forward_focus_prefix`
+  (embed→L0 full→L1 prefix) / `.forward_focus_l1_suffix` / `.forward_focus_rest` (L2..L+norm);
+  LM delegators incl. `.forward_focus_rest_and_logits`. The monolithic `forward` is untouched
+  (normal serving unaffected).
+- **`Focus.run` rewritten** to the 3-phase reduced forward: Phase P (full-block prefix) →
+  host select+compact (`build_retained_index`/`index_select`) → Phase A1 (`make_focus_phase_batch`
+  "A1", `init_forward_metadata`, L1 attn read-only on |S| vs full-block KV) → Phase S
+  (`make_focus_phase_batch` "S" + `build_phase_s_out_cache_loc`, L2..L on |S|, KV→block prefix)
+  → commit only the confident retained-masked positions. Forces `attn_backend.use_paged=True`
+  (reduced phases read K/V from cache). `SGLANG_FOCUS_LOG_REDUNDANCY=1` prints Σ|S|/(B·bs).
+- **Validated on 1×A100, LLaDA2.0-mini** via `experiments/dllm/focus_a100_smoke`:
+  focus_alpha_inf (|S|=B) == low_confidence on all 4 prompts (anchor ✓); focus α=1.5 coherent
+  with measured Σ|S|/(B·bs) ramping 0.31→1.0 within a block (real eviction / FLOPs savings ✓).
+- **Key correctness facts:** dLLM block attention is non-causal (ENCODER_ONLY) so |S| reduced
+  queries attend the full block independently; retained L≥2 KV written to the block's contiguous
+  prefix so a single `req_to_token[req,0:context+|S|]` slice reads context+retained (no custom
+  kernel). Per-phase metadata rebuilt by re-calling `init_forward_metadata` (eager).
+- **Not yet done:** DC+ behavioral wiring (decoded-in-block positions are still reprocessed each
+  step — eviction targets only non-retained masked, which is where the win is); persisting
+  FocusState across the worker boundary (budget still tracked per-`run`); CUDA-graph capture of
+  Phase S; SDAR port. None block correctness.
+
+### 2026-06-30 (session 2): Per-phase metadata builder + GPU-validated reduced-attention keystone
+- **Built the split-forward metadata builder** (`algorithm/focus_forward.py`, plan §8
+  step 4): `compute_focus_phase_lens` (per-phase `seq_lens`/`extend_prefix_lens`/
+  `extend_seq_lens` for Phase A1 q=|S| kv=context+B, and Phase S q=|S| kv=context+|S|),
+  `build_phase_s_out_cache_loc` (contiguous block-prefix KV slots), `make_focus_phase_batch`
+  (shallow-copy ForwardBatch applier, clears focus_view in the suffix). Pure tensor math,
+  no model/CUDA dep ⇒ unit-testable. Anchored against the ORIGINAL dLLM-extend metadata
+  (`seq_lens=context+B`, `extend_prefix_lens=context`, q=B) — verified in schedule_batch.py.
+- **Unit test** `test_focus_forward.py` (5 tests, green): Phase A1/S lens math, the α→∞
+  identity (|S|=B ⇒ both reduced phases reproduce the full-block metadata), out_cache_loc
+  block-prefix gather, field stamping (base ForwardBatch untouched by shallow copy).
+- **GPU micro-test** `test_focus_reduced_attention_gpu.py` (green on A100) — de-risks R4/R1
+  on real hardware via the exact FlashInfer paged-prefill call SGLang's dLLM extend makes
+  (page_size=1, causal=False, token-granular kv_indices), vs a torch dense-attention oracle:
+  (a) full-block forward == oracle; (b) **Phase A1 q=|S|<kv reproduces the retained rows
+  of the full-block forward** (FlashInfer accepts q_len<kv_len, non-causal rows independent);
+  (c) **Phase S context+|S| contiguous-prefix reads exactly context+retained**. Needs
+  `LD_PRELOAD=.../envs/sglang/lib/libstdc++.so.6` for the JIT .so (see memory note).
+- **Status:** the split-forward keystone (per-phase metadata + the FlashInfer reduced-attn
+  mechanism) is now built and hardware-validated. NOT yet done: the model-side split
+  (`forward_focus_prefix` L0-full+L1-QKV+fill / `forward_focus_suffix` L1-attn..L on |S|,
+  splitting `LLaDA2MoeAttention` into qkv_rope_fill + attention_from_q), the
+  `model_runner.forward_focus` driver, and the `Focus.run` rewire — the remaining
+  model-in-the-loop work, to be validated via the α→∞ smoke-harness anchor.
 
 ### 2026-06-30: Host-side correctness + compaction + de-risked split-forward plan
 - **Fixed budget/selection** to match official kernels (Task 1): `compute_focus_targets`

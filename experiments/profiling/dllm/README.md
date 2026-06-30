@@ -38,6 +38,12 @@ Override `DATA_ROOT` (whole tree) or `OUT` (one experiment) to relocate.
 | D8 | _(todo)_ | per-rank KV/MoE residency, page granularity |
 | D9 | _(todo)_ | inter-node collective cost (multi-node) |
 
+### FOCUS experiments (algorithmic compute reduction, not the D-series distributed plan)
+
+| Exp | Folder | Question |
+|---|---|---|
+| **F1** | `focus_vs_lowconf/` | FOCUS paper-exact reduced forward vs LowConfidence — throughput/latency + processed-token redundancy Σ\|S\|/(B·bs), LLaDA2.0-mini 1×A100 TP=1 eager |
+
 ## Prerequisites
 
 - conda env `sglang` active; `nsys` on PATH.
