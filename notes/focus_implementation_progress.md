@@ -49,7 +49,100 @@ Target: Phase A correctness (eager, with DC+, single GPU)
 
 ## Changes Log
 
-### 2026-06-29: Initial setup
+### 2026-07-01 (session 4): §B1+§B2 Triton kernels LANDED + validated (importance + selection)
+Ported the two loop-bearing host helpers to Triton, closing the Phase-B kernel work. New file
+`algorithm/focus_kernels.py` (the torch helpers in `focus_utils.py` stay as the CPU/numerical
+oracles). Gated behind `SGLANG_FOCUS_KERNEL=1` (default OFF, oracle path unchanged).
+- **§B2 selection kernel** `focus_select_and_enforce` ⇔ oracle `select_and_enforce_constraints`
+  (the ~14% host lever, F3-lite). Grid `(bs,)`, one program per request over `BLOCK=next_pow2(B)`
+  lanes (the SGLang FOCUS prefix is a **uniform block_size** processing set, so NO official
+  CSR/INDPTR ragged machinery needed — much simpler than the LMDeploy original). Reproduces every
+  step of the oracle: budget clamp (not-evict⇒target0⇒retain all masked), iterative top-`target`
+  by ΔI (matches `torch.topk` for distinct scores, lowest-lane on ties), N_σ threshold-OR-topk
+  expansion (mean+std, float32), AR-context predecessor (store→`tl.debug_barrier()`→shifted reload,
+  the official trick for reading the block-adjacent successor's retain state), min-keep safety net,
+  placeholder integrity (rightmost-retained + block_progress gate). All stats in **float32**
+  (matches the *official* kernel; the bf16 torch oracle was the lossy one).
+- **§B1 importance kernel** `focus_importance` ⇔ oracle `compute_importance_side_channel` (the
+  per-request einsum inside L0/L1 attention). Faithful port of `_focus_importance_ragged_kernel`:
+  grid `(bs·H·B,)` per (seq,head,query), streamed 3-point (k=3) MaxPool over keys with −inf padding
+  (prev/curr/next), two-pass softmax over the padded workspace, `atomic_add` of the softmax weights
+  into `importance[key]` (column-wise sum over queries+heads). **Handles GQA internally**
+  (`kv_head = head // num_key_value_groups`) so the model passes the UN-broadcast kv heads — drops
+  the `repeat_interleave` on the eager path. `maxpool_k` fixed at 3 (paper/official default; raises
+  for other k).
+- **Wiring**: `focus.py::_select_retained` calls the selection kernel when `self._use_kernel`;
+  `FocusRuntimeView.use_kernel` threads the flag to `llada2.py::_collect_focus_importance`, which
+  routes to the importance kernel. Both fall back to the exact oracle when the env is unset.
+- **Tests** `test_focus_kernels_gpu.py` (A100, green): selection kernel **bit-exact vs oracle** over
+  a random sweep (B∈{8,16,32,48}, bs∈{1,4,8}, α∈{1,1.5,3,∞}, ±block_progress) **and** all 7 pinned
+  selection-logic cases (α→∞, small-α, N_σ fires/off, AR-context, placeholder, progress gate);
+  importance kernel matches the float32 oracle to **≤6e-6** (MHA + GQA H8/2). All 7 FOCUS CPU test
+  files still green.
+- **HW validation** (`focus_a100_smoke`, `SGLANG_FOCUS_KERNEL=1`): **α→∞ kernel == eager baseline
+  4/4 bit-identical** (the anchor); **α=1.5 kernel coherent** with real eviction (redundancy
+  Σ|S|/(B·bs) ramps 0.31→1.0, mean 0.684 — matches the documented eager curve) AND 4/4 bit-identical
+  to the eager α=1.5 baseline (the fp32-vs-bf16 selection didn't flip any commit on these prompts).
+- **Status**: Phase-B kernels done. Next perf steps unchanged — flip `SGLANG_FOCUS_KERNEL` default
+  after an F1 re-measure (expect the ~14% `select` share to shrink), then the §C fixed-shape graph
+  rework (the ~62% lever). `compute_focus_targets` was left as vectorized torch (already O(1), no
+  loop — porting its trivial official kernel is nil value).
+
+### 2026-07-01 (session 4b): F5 — kernel ON/OFF profiling → Phase-B kernels are a real wall-clock win
+New experiment `experiments/profiling/dllm/focus_kernel/` (run/parse + README report; data mirror
+`/cephfs/shared/wxli/sglang-dllm/profiling/dllm/focus_kernel/logs`). FOCUS-vs-FOCUS, `SGLANG_FOCUS_KERNEL`
+OFF(oracle) vs ON(Triton), LLaDA2.0-mini 1×A100 eager, HumanEval conc {1,8,16}.
+- **Throughput: ON is 1.04 / 1.23 / 1.41× OFF at conc 1 / 8 / 16** (61→64, 232→285, 281→**395** tok/s).
+  The win scales with batch because the removed cost was **O(bs) host work/step** (Python per-request
+  selection loop + per-request importance einsum). At conc-16 kernel-FOCUS (395) **draws level with the
+  F1 LowConfidence baseline (388)** — the §B kernels close the entire eager host-overhead gap that made
+  prototype FOCUS 0.69× at conc-16.
+- **Redundancy unchanged** (0.662/0.796/0.807 OFF vs 0.661/0.792/0.799 ON, Δ≤0.008): the kernels change
+  HOW importance/selection compute, not WHICH tokens evict — pure host-efficiency win, identical model
+  behavior (α→∞ anchor stays bit-identical, session 4).
+- **Phase split (conc-8, `SGLANG_FOCUS_PHASE_TIMING=1`, shares are the signal):** `select` **12.1%→2.4%**
+  (host loop → 1 Triton launch, −84% ms / 6.2×; the §B2 target) · `p_fwd` **17.4%→12.0%** (§B1 kernel +
+  dropped `repeat_interleave`, −43% ms) · together host share **29.5%→14.4%**. `s_fwd` unchanged in ms but
+  rises to **67.5%** of the now-smaller total → **§C (Phase-S CUDA graph) is even more clearly the next
+  lever**. Total wall (sync-inflated) −18%.
+- **vs LowConfidence (same-session baseline, `run_lowconf_baseline.sh`):** LowConf = 66/276/375 tok/s.
+  **kernel-FOCUS/LowConf = 0.96 / 1.03 / 1.05×** — FOCUS now **beats LowConfidence at conc 8 & 16**,
+  near-parity at conc-1, advantage GROWING with batch. This FLIPS the F1 result (oracle FOCUS = 0.93/0.84/
+  0.75×, a loss widening with batch — reproduced here). Kernel-FOCUS mean latency also crosses below
+  LowConf at conc 8/16 (3.41/4.67s vs 3.59/4.89s). First config where the paper's eviction (redundancy
+  0.66–0.80) becomes a real wall-clock win over the stock path in the eager small-MoE regime.
+- **Takeaway:** §B is done AND measured-positive (FOCUS ≥ LowConfidence with kernels). Reasonable to flip
+  `SGLANG_FOCUS_KERNEL` default ON (redundancy-neutral, strictly less host work, never hurts) — left OFF
+  pending a wider confirmation. Next: §C fixed-shape Phase-S graph (widens the margin; attacks the 67.5%
+  `s_fwd` both paths pay).
+
+### 2026-07-01 (session 4c): F6 — nsys kernel-level analysis: WHY the FOCUS speedup is minor
+New experiment `experiments/profiling/dllm/focus_nsys/` (run_nsys.sh + parse_nsys.py + README report;
+data mirror `/cephfs/shared/wxli/sglang-dllm/profiling/dllm/focus_nsys`). nsys 2025.1.1 (the sglang-env
+2025.2.1 has a broken qdstrm importer — only produces .qdstrm; use `envs/eval_310/...2025.1.1/...nsys`),
+`-t cuda,nvtx`, CUDA_PROFILER-bracketed, `SGLANG_DLLM_NVTX=1` tags the phases. kernel-FOCUS vs
+LowConfidence, conc 8, eager. Three findings explain the ~1.03–1.05× (vs paper 2.32×):
+- **(1) >50% GPU-IDLE — launch-bound.** FOCUS 56.1% idle / LC 52.5% idle (busy 2645/2821ms of 6021/5946ms
+  span; 131k/121k kernels @ ~20µs). Half the wall is eager per-layer/per-expert launch gaps → any FLOPs cut
+  can only attack the ~44% GPU-busy (Amdahl caps it before eviction matters).
+- **(2) GPU compute cut is only −6.2%, NOT the ~25% eviction — the MoE kernel doesn't scale with tokens.**
+  `fused_moe_kernel` = ~69% of GPU-busy, drops only 7.6% (1814 vs 1963ms) for a 25% token cut: the
+  256-expert/top-8 grouped-GEMM with few tokens/expert is **occupancy/launch-bound, not per-token-FLOP-bound.**
+  Only **attention** scales with tokens (−30.5%, 69.8 vs 100.5ms) but it's just 2.6% of GPU time. moe/gemm
+  is 87% of GPU time both paths.
+- **(3) FOCUS gives ~17% back as structure LC skips.** Per-NVTX GPU-proj: `focus_suffix` (L2..L on |S|)
+  82.8% (the win) BUT a **full-block final forward (KV repop) 6.1%** + full-block prefix (L0+L1) 4.2% + A1
+  4.8% + commit 2.2% — structure LowConfidence (one forward 95% + select 5%) never pays; plus +8% more
+  kernel launches feeding the launch-bound idle.
+- **vs paper 2.32× (two regime gaps, not bugs):** (a) eviction headroom ~3× smaller here — redundancy 0.75
+  kept (~25% evicted) vs the paper's ~90%; (b) launch-bound eager small-MoE ≠ compute-bound — even the FLOPs
+  FOCUS cuts don't convert to wall when >50% is GPU-idle and the MoE kernel is underutilized.
+- **Bottleneck = MoE forward (`fused_moe_kernel`, ~69% GPU-busy) in an eager launch-bound regime.** Levers,
+  in order: **§C Phase-S CUDA graph** (collapse ~18 eager L2..L launches → 1 replay, attacks the 56% idle —
+  nsys makes this THE lever) · a compute-bound regime (bigger model/ctx where MoE GEMM scales with tokens) ·
+  cut FOCUS structural overhead (incremental KV repop instead of the full-block final forward).
+
+### 2026-06-29: Initial setup22222222222222
 - Created branch `feature/focus-implementation`
 - Created progress tracking document
 

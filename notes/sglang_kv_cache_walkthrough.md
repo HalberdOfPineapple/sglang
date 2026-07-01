@@ -92,6 +92,25 @@ event_loop_normal():                                       scheduler.py:1551
 
 `get_next_batch_to_run` (`scheduler.py:2501`) is the fork: it first tries to build a **prefill** batch via `get_new_batch_prefill` (`scheduler.py:2580/2627`); if there is nothing to prefill, it advances the running batch one **decode** step via `update_running_batch` (`scheduler.py:2604/2909`). The next three subsections follow each path down to the pools.
 
+### 3.1 The grammar gate: an admission stage that runs *before* any KV is allocated
+
+`GrammarManager` (`grammar_manager.py:25`, constructed once in `Scheduler.__init__` at `scheduler.py:507`) matters to the KV story not because it touches the KV layers — it never does — but because it decides *when* a constrained request is first allowed to reach §4 and consume slots. It is the one admission stage that can hold a request out of the `waiting_queue` entirely, so a request's KV lifetime cannot begin until its grammar is ready. Understanding this closes the "where does a request enter the waiting queue?" gap that sits just upstream of prefill.
+
+A new request lands in `handle_generate_request`, which calls `process_req_with_grammar(req)` (`scheduler.py:2223`). If the request carries a `json_schema` / `regex` / `ebnf` / `structural_tag` (`grammar_manager.py:92`) and the compiled grammar is **not** already cached, the manager kicks off an async compile (a `futures.Future` from the grammar backend, `grammar_manager.py:111`), appends the request to its private `grammar_queue` (`grammar_manager.py:138`), and returns `True`. Back in the scheduler, that `True` means `_add_request_to_queue` is **skipped** (`scheduler.py:2224`) — so the request is *not* in the `waiting_queue`, `PrefillAdder` never sees it, and no `ReqToTokenPool` row or KV slots are reserved for it while its grammar compiles. On a grammar **cache hit** the future is already resolved, `req.grammar` is set inline, and the request drops straight into the normal `waiting_queue` with no gating.
+
+The gate is drained at the very top of the prefill entry point, before the `PrefillAdder` loop of §4 runs:
+
+```
+_get_new_batch_prefill_raw():                              scheduler.py:2648
+  if self.grammar_manager.has_waiting_grammars():          scheduler.py:2649
+      ready = self.grammar_manager.get_ready_grammar_requests()   scheduler.py:2650 → grammar_manager.py:142
+      for req in ready: self._add_request_to_queue(req)    scheduler.py:2651   ← NOW it can be prefilled → §4
+```
+
+`get_ready_grammar_requests` (`grammar_manager.py:142`) polls `future.done()` for a bounded interval, then — critically for a multi-rank deployment — `all_gather_object`s the ready/failed index sets across the TP/DP group and takes the **intersection** of ready and the **union** of failed (`grammar_manager.py:193-199`), so every rank admits the exact same request set on the same step. That lockstep is what keeps the subsequent collective forward (and its per-rank KV allocation in §4) from diverging. Requests that never compile in time are timed out after `SGLANG_GRAMMAR_MAX_POLL_ITERATIONS` (`grammar_manager.py:179`) and finished with an abort, so they leave the gate without ever allocating KV.
+
+Two smaller couplings to keep in mind, neither of which allocates KV: (1) a batch with grammar forces the overlap scheduler off — `need_grammar_sync` (`scheduler.py:1655`) — because the grammar state machine must observe each sampled token before the next step, so grammar changes forward *scheduling* but not the slot math of §4/§5; (2) the scheduler counts a pending `grammar_queue` as non-idle (`scheduler.py:3329`), so it will not tear down or sleep while grammars are still compiling. Where grammar *does* act is strictly at sampling time, after the forward: `SamplingBatchInfo.update_regex_vocab_mask` builds a `vocab_mask` from each request's grammar (`sampling_batch_info.py:208`) and `apply_mask_func` bans disallowed tokens on the logits (`sampling_batch_info.py:266`). That path reads and writes logits only — it is entirely disjoint from `ReqToTokenPool` / allocator / `KVCache`, which is why grammar involvement in the KV subsystem is purely one of admission timing.
+
 ## 4. Prefill / extend: from waiting queue to allocated slots
 
 This is "where a batch enters prefill." Trace:
@@ -100,6 +119,7 @@ This is "where a batch enters prefill." Trace:
 get_next_batch_to_run()                                    scheduler.py:2580
   └─ get_new_batch_prefill()                               scheduler.py:2627
        └─ _get_new_batch_prefill_raw():                    scheduler.py:~2680
+            drain grammar gate → waiting_queue             scheduler.py:2648   ← see §3.1
             for req in waiting_queue (via PrefillAdder):
               req.init_next_round_input(self.tree_cache)    scheduler.py:2766   ← PREFIX MATCH happens here
               adder.add_one_req(req, ...)                   scheduler.py:2767   ← admission/budget check
@@ -108,11 +128,78 @@ get_next_batch_to_run()                                    scheduler.py:2580
             new_batch.prepare_for_extend()                  scheduler.py:2843   ← ALLOCATION happens here
 ```
 
-### 4.1 Prefix match at admission (`init_next_round_input` → `match_prefix`)
+### 4.1 `PrefillAdder`: the admission controller between the queue and allocation
+
+The waiting queue almost always holds more work than one forward pass can take: more requests than there are free `ReqToTokenPool` rows, and more new tokens than fit in either the per-step compute budget or the free KV memory. `PrefillAdder` (`schedule_policy.py:407`) is the greedy admission controller that resolves this. Its job is to walk the priority-ordered queue and admit the **longest prefix of it that can be prefilled this step without over-committing compute or OOMing the KV pool**, deciding per request whether it goes in whole, gets truncated into a chunk, or is refused — and, crucially, to reserve the KV memory for every request it admits so the actual allocation in §4.3 cannot fail. It is the bridge between "policy ordered the queue" and "`ScheduleBatch` allocates the slots"; it does not itself touch `ReqToTokenPool` / allocator / `KVCache` bytes (that is §4.3), it only *decides and reserves against budgets*.
+
+It is built fresh every prefill pass and thrown away at the end — it is pure per-batch scratch state, not a long-lived object. The scheduler first priority-sorts the queue, then constructs the adder with live references to the KV layers, then loops:
+
+```
+_get_new_batch_prefill_raw():                              scheduler.py:2645
+  self.policy.calc_priority(waiting_queue, running_batch)  scheduler.py:2682   ← sort queue (LPM/FCFS/priority/DFS)
+  adder = PrefillAdder(page_size, tree_cache,              scheduler.py:2699
+                       token_to_kv_pool_allocator, running_batch,
+                       max_prefill_tokens, chunked_prefill_size, ...)
+  if self.chunked_req: self.chunked_req = adder.add_chunked_req(self.chunked_req)   scheduler.py:2719  ← finish last chunk first
+  for req in self.waiting_queue:                           scheduler.py:2736
+      if len(adder.can_run_list) >= get_num_allocatable_reqs(running_bs):          scheduler.py:2741
+          running_batch.batch_is_full = True                                        ← request-count cap (free req rows)
+      if running_batch.batch_is_full: break                                         scheduler.py:2749
+      req.init_next_round_input(self.tree_cache)           scheduler.py:2766   ← §4.2 prefix match, sets req.last_node
+      res = adder.add_one_req(req, ...)                    scheduler.py:2767   ← the budget decision
+      if res != AddReqResult.CONTINUE: break               scheduler.py:2776   ← stop admitting
+  can_run_list = adder.can_run_list                        scheduler.py:2802
+  self.waiting_queue = [x for x in waiting_queue if x not in can_run_set]   scheduler.py:2807  ← remove admitted
+  new_batch = ScheduleBatch.init_new(can_run_list, ...)    scheduler.py:2826  → §4.3 real allocation
+```
+
+So the adder never allocates; it produces `can_run_list` (the admitted requests, with each request's `extend_input_len`/`fill_ids` possibly truncated for chunking) plus `new_chunked_req`. Everything after the loop hands that list to `ScheduleBatch.init_new` → `prepare_for_extend`, which is where §4.3 turns the reservation into real slots.
+
+**The two budgets it tracks.** The whole class is bookkeeping over two independent budgets, and confusing them is what makes the code hard to read:
+
+| Budget | Fields | Source | Meaning / what stops admission |
+| --- | --- | --- | --- |
+| **Compute / latency** | `rem_input_tokens`, `rem_chunk_tokens` | `max_prefill_tokens`, `chunked_prefill_size` (`scheduler.py:2705-2706`) | Caps the number of **new (extend) tokens computed this forward**. Exhausted → `AddReqResult.OTHER` (stop, but batch is *not* "full" — memory is fine, we just hit the per-step compute cap or a chunk boundary). |
+| **KV memory** | `rem_total_tokens`, `cur_rem_tokens`, (`rem_swa_tokens`) | `allocator.available_size() + tree_cache.evictable_size() − offset` (`schedule_policy.py:499`, `526`) | Caps total KV slots the admitted set may consume. Exhausted → `AddReqResult.NO_TOKEN` (stop **and** set `batch_is_full`). |
+
+The KV-memory budget is the key connection to the rest of this note: admission counts `available_size()` (currently-free slots) **plus** `evictable_size()` (slots held by unlocked prefix-cache leaves that eviction could reclaim). It deliberately over-commits against evictable memory, trusting that the evict-then-alloc path in §4.3 (`alloc_token_slots` → `evict_from_tree_cache`, §8) will actually free those slots when the allocation runs. This is why the admission math and the allocation math agree: both treat "free + evictable" as the real capacity. `rem_total_tokens` vs `cur_rem_tokens` are two views of that same pool with different reservations — `rem_total` also reserves each admitted request's *future decode growth* (`extend + max_new_tokens + page`, via `rem_total_token_offset`), so the batch cannot admit so many prompts that their eventual decode would OOM; `cur_rem` reserves only the *immediate* extend allocation (`extend + page`). `budget_state()` (`schedule_policy.py:565`) fails if **either** is non-positive.
+
+**Per-request decision — `add_one_req` (`schedule_policy.py:815`).** For one request off the sorted queue:
+
+```
+add_one_req(req):                                          schedule_policy.py:815
+  prefill_delayer veto? / cp batch-size-1? / prefill_max_requests? → OTHER   :818-837
+  total = req.extend_input_len + max_new + page_size
+  if total >= rem_total_tokens:            return NO_TOKEN  :858   ← memory pre-check (incl. decode headroom)
+  if real_input_tokens >= rem_input_tokens and can_run_list: return OTHER     :866  ← compute cap
+  with self._lock_node(req.last_node):     :869   ← TEMP admission lock: inc_lock_ref on matched prefix
+      if total >= rem_total_tokens:        return NO_TOKEN  :871   ← RECHECK: locking shrank evictable_size
+      if req.host_hit_length > 0: init_load_back(...)       :879   ← pull HiCache host prefix back to device
+      if not chunked:                                       :907
+          can_run_list.append(req)                          :909   ← ADMITTED
+          self._req_inc_lock_ref(req)                       :911   ← PERSISTENT lock, held through the forward
+          self._update_prefill_budget(prefix_len, input_tokens, max_new)   :912  ← deduct from both budgets
+      else:                                                 :920
+          trunc_len = page-aligned rem_chunk_tokens                        ← CHUNK the oversized prompt
+          req.set_extend_input_len(trunc_len); req.fill_ids = fill_ids[:...]
+          can_run_list.append(req); self.new_chunked_req = req             :949-950
+          self._req_inc_lock_ref(req); self._update_prefill_budget(...)
+  return self.budget_state()               :955   ← CONTINUE / NO_TOKEN / OTHER for the *next* request
+```
+
+Three KV-specific subtleties worth calling out, because they are exactly where admission and the KV layers interlock:
+
+- **The admission lock is why the budget shrinks as you admit.** `_lock_node` (`schedule_policy.py:703`) is a context manager that `inc_lock_ref`s the request's matched prefix (`req.last_node`) *before* deciding, so the prefix this request wants to reuse cannot be evicted by the adder's own later admissions in the same pass. Locking moves those tokens from `evictable_size_` to `protected_size_`, so `rem_total_tokens` legitimately **drops** the moment a prefix is locked — hence the re-check of the same budget *inside* the `with` block (`schedule_policy.py:871`). When the request is actually admitted, a **second, persistent** `_req_inc_lock_ref` (`schedule_policy.py:911`) is taken and left in place; the temporary context lock is released at block exit, so an admitted request nets exactly one lock that protects its prefix through the whole forward (this is the lock §7.3 later decrements at finish). A *rejected* request only ever held the temporary lock, which is released on the early return — no leak.
+- **The request-count cap is a `ReqToTokenPool`-row cap.** `get_num_allocatable_reqs` (`scheduler.py:2622`) is `pp_max_micro_batch_size − running_bs`, floored by `req_to_token_pool.available_size()` — i.e. the number of free *rows*. So even when tokens fit, the adder stops at the number of free `ReqToTokenPool` rows (§2's `[max_reqs+1, max_ctx]` bound), setting `batch_is_full` (`scheduler.py:2741`).
+- **Chunked prefill is decided here, and it keeps a KV footprint across batches.** When a prompt is larger than `rem_chunk_tokens`, the adder truncates `extend_input_len` to a page-aligned `trunc_len` and records `new_chunked_req` (`schedule_policy.py:946-950`); the remainder continues next pass via `add_chunked_req` (`scheduler.py:2719`), which is run *first*, before new requests, so an in-flight chunked prompt always makes progress. That partially-filled request keeps its `ReqToTokenPool` row and its already-written slots between batches — the `req_pool_idx`-reuse path of §4.3 — and is the reason `cache_unfinished_req(chunked=True)` (§7.1) exists.
+
+dLLM note: with a diffusion config the adder swaps the chunk budget for a block budget — `rem_dllm_tokens = max_running_requests * block_size` (`schedule_policy.py:487`) — and `add_dllm_staging_req` / `_add_dllm_req` (`schedule_policy.py:640, 618`) truncate admission to whole denoising blocks rather than arbitrary chunk lengths, so a block's positions (masked and unmasked alike) are admitted and slot-reserved together, matching the block-granular `DLLM_EXTEND` allocation in §4.3.
+
+### 4.2 Prefix match at admission (`init_next_round_input` → `match_prefix`)
 
 For each candidate request, `req.init_next_round_input(self.tree_cache)` (`scheduler.py:2766`) calls `tree_cache.match_prefix(...)` (`schedule_batch.py:1027`). The returned `MatchResult.device_indices` becomes `req.prefix_indices` (slots reused for free, already on GPU), and `req.last_node` is the tree node to lock. This is the entire payoff of prefix caching: a shared system prompt is computed once, and every later request reuses those exact slots instead of recomputing them. In `RadixCache.match_prefix` (`radix_cache.py:360`), the work is done by `_match_prefix_helper` (`radix_cache.py:645`), which walks children by `child_key`, and `_split_node` (`radix_cache.py:671`) if a match ends inside a stored segment so the boundary becomes a real node.
 
-### 4.2 Allocation (`prepare_for_extend` → `alloc_for_extend`)
+### 4.3 Allocation (`prepare_for_extend` → `alloc_for_extend`)
 
 `prepare_for_extend` (`schedule_batch.py:1688`) sets `forward_mode = EXTEND` (or `DLLM_EXTEND` for diffusion, `schedule_batch.py:1693`), computes `prefix_lens`/`extend_lens`/`seq_lens` from `req.fill_ids` and `req.prefix_indices` (`schedule_batch.py:1697-1702`), and then calls `alloc_for_extend(self)` (`schedule_batch.py:1749`). That helper (`common.py:429`) orchestrates the three lower layers:
 
@@ -219,6 +306,8 @@ alloc_token_slots / alloc_paged_*                          common.py:302 / 356 /
 ## 9. One request's full lifetime (everything together)
 
 ```
+gate    handle_generate_request → process_req_with_grammar                (if constrained) held in grammar_queue, NO KV yet
+        (scheduler.py:2223 → grammar_manager.py:89)   ready→ _add_request_to_queue (scheduler.py:2648)
 admit   get_new_batch_prefill → init_next_round_input → match_prefix     reuse prefix slots, lock last_node
         (scheduler.py:2766 → radix_cache.py:360)
 prefill prepare_for_extend → alloc_for_extend                            ReqToTokenPool row + new slots

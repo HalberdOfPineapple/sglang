@@ -32,6 +32,9 @@ class FocusRuntimeView:
     importance_layers: Tuple[int, ...] = (0, 1)
     # avg_decoded[b] = N̄_decoded for request b (cumulative-mean decode yield)
     avg_decoded: Optional[torch.Tensor] = None
+    # When True the attention layers compute importance via the Triton kernel
+    # (§B1, focus_kernels.focus_importance) instead of the torch oracle.
+    use_kernel: bool = False
     # Filled in by attention layers, keyed by layer_id.
     importance: dict = field(default_factory=dict)
 

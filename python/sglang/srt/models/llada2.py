@@ -661,19 +661,35 @@ class LLaDA2MoeAttention(nn.Module):
         # q,k arrive as [num_tokens, q_size]/[num_tokens, kv_size]; reshape to heads.
         num_tokens = q.shape[0]
         q_h = q.view(num_tokens, self.num_heads, self.head_dim)
-        # MQA/GQA: broadcast kv heads to query heads for the score side-channel.
         k_h = k.view(num_tokens, self.num_kv_heads, self.head_dim)
-        if self.num_kv_heads != self.num_heads:
-            rep = self.num_heads // self.num_kv_heads
-            k_h = k_h.repeat_interleave(rep, dim=1)
 
-        importance = compute_importance_side_channel(
-            q_h,
-            k_h,
-            focus_view.seq_offsets,
-            self.scale,
-            maxpool_k=focus_view.maxpool_k,
-        )
+        if getattr(focus_view, "use_kernel", False):
+            # §B1: Triton importance kernel handles GQA internally (kv_head =
+            # head // groups), so pass the UN-broadcast kv heads — no
+            # repeat_interleave. Reduces in float32 (matches the official kernel).
+            from sglang.srt.dllm.algorithm.focus_kernels import focus_importance
+
+            importance = focus_importance(
+                q_h,
+                k_h,
+                focus_view.seq_offsets,
+                self.scale,
+                focus_view.block_size,
+                num_key_value_groups=self.num_heads // self.num_kv_heads,
+                maxpool_k=focus_view.maxpool_k,
+            )
+        else:
+            # MQA/GQA: broadcast kv heads to query heads for the score side-channel.
+            if self.num_kv_heads != self.num_heads:
+                rep = self.num_heads // self.num_kv_heads
+                k_h = k_h.repeat_interleave(rep, dim=1)
+            importance = compute_importance_side_channel(
+                q_h,
+                k_h,
+                focus_view.seq_offsets,
+                self.scale,
+                maxpool_k=focus_view.maxpool_k,
+            )
         focus_view.set_layer_importance(self.layer_id, importance)
 
 

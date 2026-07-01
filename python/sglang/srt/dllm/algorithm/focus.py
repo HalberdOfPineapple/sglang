@@ -87,6 +87,11 @@ class Focus(DllmAlgorithm):
         # default OFF. Lazily built on first run; any failure falls back to eager.
         self._graph_enabled = os.environ.get("SGLANG_FOCUS_GRAPH") == "1"
         self._graph_runner = None
+        # SGLANG_FOCUS_KERNEL=1 routes importance (§B1) + selection/enforcement
+        # (§B2) through the Triton kernels (algorithm/focus_kernels.py) instead of
+        # the PyTorch oracles. Bit-exact for selection, ~1e-6 for importance
+        # (both reduce in float32 like the official kernels). Default OFF.
+        self._use_kernel = os.environ.get("SGLANG_FOCUS_KERNEL") == "1"
 
     def _ensure_graph_runner(self, model_runner):
         if self._graph_runner is not None or not self._graph_enabled:
@@ -134,6 +139,7 @@ class Focus(DllmAlgorithm):
             maxpool_k=self.maxpool_k,
             importance_layers=self.importance_layers,
             avg_decoded=avg_decoded,
+            use_kernel=self._use_kernel,
         )
 
     def _select_retained(
@@ -161,6 +167,16 @@ class Focus(DllmAlgorithm):
             mask_lengths, focus_view.avg_decoded, self.alpha
         )
         should_evict = compute_should_evict(mask_lengths, targets)
+        if self._use_kernel:
+            # §B2: fused per-request selection/enforcement in one Triton launch
+            # (replaces the host Python loop; bit-exact vs the oracle).
+            from sglang.srt.dllm.algorithm.focus_kernels import (
+                focus_select_and_enforce,
+            )
+
+            return focus_select_and_enforce(
+                delta_I, mask, targets, should_evict, self.block_size
+            )
         retain_masks, _ = select_and_enforce_constraints(
             delta_I,
             mask,
